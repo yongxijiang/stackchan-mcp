@@ -426,19 +426,39 @@ public:
     Si12T(i2c_master_bus_handle_t i2c_bus, uint8_t addr = DEFAULT_ADDR)
         : I2cDevice(i2c_bus, addr) {}
 
-    // Probe the chip and bring it out of sleep. Returns true on success.
+    // Probe the chip, configure sensitivity, force recalibration, and bring
+    // it into normal sensing mode.  Returns true on success.
     bool Begin() {
         uint8_t ctrl = 0;
         if (!SafeReadReg(REG_CTRL, &ctrl)) {
             return false;
         }
-        // CTRL bit1 = SLEEP. Clear it; bit1:0 must hold 1 per datasheet
-        // ("CTRL Bit1, Bit0 = 1 1" reset value), so write 0b00000011.
+
+        // 1. Put the chip to sleep first so we get a clean recalibration
+        //    cycle when we wake it.
+        SafeWriteReg(REG_CTRL, 0x07);            // SLEEP=1
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // 2. Set channel sensitivity.  Each register packs two channels
+        //    (high nibble = even CH, low nibble = odd CH). Range 0..F;
+        //    lower = MORE sensitive.  Default is typically 0x55.
+        //    We use 0x33 (fairly sensitive) for the StackChan head zones.
+        SafeWriteReg(REG_SENS1, 0x33);   // CH1, CH2
+        SafeWriteReg(REG_SENS2, 0x33);   // CH3, CH4
+
+        // 3. Wake the chip (clear SLEEP, keep bit1:0 = 11).
         if (!SafeWriteReg(REG_CTRL, 0x03)) {
             return false;
         }
-        // Verify the device actually responds on the output register.
-        // 0xFF would indicate an open bus / no device.
+
+        // 4. Force reference recalibration on all channels. The sensor
+        //    re-measures the baseline capacitance after this write.
+        SafeWriteReg(REG_REF_RST, 0xFF);
+        vTaskDelay(pdMS_TO_TICKS(300));  // Wait for recalibration to settle
+
+        // 5. Read Output1 and record the boot baseline.  Any channels
+        //    that are "on" right after recalibration are considered stuck
+        //    (e.g. physical coupling to the housing) and will be masked.
         uint8_t out1 = 0;
         if (!SafeReadReg(REG_OUTPUT1, &out1)) {
             return false;
@@ -447,12 +467,15 @@ public:
             ESP_LOGW("Si12T", "Output1 read 0xFF (likely no device)");
             return false;
         }
-        ESP_LOGI("Si12T", "init OK: ctrl=0x%02X out1=0x%02X (sleep cleared)", ctrl, out1);
+        boot_baseline_ = out1;
+        ESP_LOGI("Si12T", "init OK: ctrl=0x%02X out1=0x%02X baseline=0x%02X (recalibrated)",
+                 ctrl, out1, boot_baseline_);
         return true;
     }
 
     // Sample channels CH1..CH3 from Output1 (0x10). Single-shot read; the
     // caller is expected to debounce / interpret duration externally.
+    // Channels that were stuck at boot are masked out automatically.
     TouchState ReadTouchState() {
         TouchState s = {};
         s.ok = false;
@@ -460,16 +483,24 @@ public:
             return s;
         }
         s.ok = true;
+        // Mask out channels that were "on" at boot (stuck / housing-coupled).
+        uint8_t effective = s.output1_raw & ~boot_baseline_;
         // Each channel uses 2 bits; nonzero = touched at some level.
-        s.zone[0] = ((s.output1_raw >> 0) & 0x3) != 0;  // CH1
-        s.zone[1] = ((s.output1_raw >> 2) & 0x3) != 0;  // CH2
-        s.zone[2] = ((s.output1_raw >> 4) & 0x3) != 0;  // CH3
+        s.zone[0] = ((effective >> 0) & 0x3) != 0;  // CH1
+        s.zone[1] = ((effective >> 2) & 0x3) != 0;  // CH2
+        s.zone[2] = ((effective >> 4) & 0x3) != 0;  // CH3
         return s;
     }
 
+    uint8_t boot_baseline() const { return boot_baseline_; }
+
 private:
+    static constexpr uint8_t REG_SENS1   = 0x02;  // Sensitivity CH1+CH2
+    static constexpr uint8_t REG_SENS2   = 0x03;  // Sensitivity CH3+CH4
     static constexpr uint8_t REG_CTRL    = 0x09;  // CTRL, SLEEP bit etc.
+    static constexpr uint8_t REG_REF_RST = 0x0A;  // Reference reset (recalib)
     static constexpr uint8_t REG_OUTPUT1 = 0x10;  // CH1..CH4 packed (2bpp)
+    uint8_t boot_baseline_ = 0;                   // channels stuck at boot
 
     bool SafeReadReg(uint8_t reg, uint8_t* out) {
         esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, out, 1, 100);
@@ -1410,6 +1441,10 @@ private:
             ESP_LOGW(TAG, "Si12T not detected; head-touch disabled (other features unaffected)");
             si12t_.reset();
             return;
+        }
+        uint8_t bl = si12t_->boot_baseline();
+        if (bl) {
+            ESP_LOGW(TAG, "Si12T boot baseline=0x%02X — stuck channels will be masked", bl);
         }
 
         esp_timer_create_args_t poll_args = {
