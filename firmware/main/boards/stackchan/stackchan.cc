@@ -791,29 +791,35 @@ private:
     void PollTouchpad() {
         static bool was_touched = false;
         static int64_t touch_start_time = 0;
-        const int64_t TOUCH_THRESHOLD_MS = 500;  // 触摸时长阈值，超过500ms视为长按
-        
+        const int64_t TAP_THRESHOLD_MS   = 400;  // short tap → toggle chat
+        const int64_t STROKE_THRESHOLD_MS = 400;  // hold ≥400ms → nuzzle!
+
         ft6336_->UpdateTouchPoint();
         auto& touch_point = ft6336_->GetTouchPoint();
-        
+
         // 检测触摸开始
         if (touch_point.num > 0 && !was_touched) {
             was_touched = true;
-            touch_start_time = esp_timer_get_time() / 1000; // 转换为毫秒
-        } 
+            touch_start_time = esp_timer_get_time() / 1000;
+        }
         // 检测触摸释放
         else if (touch_point.num == 0 && was_touched) {
             was_touched = false;
             int64_t touch_duration = (esp_timer_get_time() / 1000) - touch_start_time;
-            
-            // 只有短触才触发
-            if (touch_duration < TOUCH_THRESHOLD_MS) {
+
+            if (touch_duration < TAP_THRESHOLD_MS) {
+                // Short tap: original behaviour (wifi config / toggle chat)
                 auto& app = Application::GetInstance();
                 if (app.GetDeviceState() == kDeviceStateStarting) {
                     EnterWifiConfigMode();
                     return;
                 }
                 app.ToggleChatState();
+            } else if (touch_duration >= STROKE_THRESHOLD_MS) {
+                // Long press on screen → trigger nuzzle reaction (蹭蹭)!
+                // Same logic as the Si12T head-stroke handler.
+                ESP_LOGI(TAG, "Screen touch stroke (%lldms) → nuzzle!", (long long)touch_duration);
+                HandleStroke((uint64_t)touch_duration);
             }
         }
     }
