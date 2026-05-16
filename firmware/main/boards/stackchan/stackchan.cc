@@ -582,8 +582,8 @@ private:
                                                   // inject brief "all-false"
                                                   // gaps that cut a real stroke
                                                   // short of 600 ms.
-    static constexpr int REACTION_HOLD_MS = 3000;
-    static constexpr int COOLDOWN_MS      = 800;  // post-reaction noise gate
+    static constexpr int REACTION_HOLD_MS = 2000;
+    static constexpr int COOLDOWN_MS      = 400;  // post-reaction noise gate
     // With 2-sample debounce this gives ~200 ms confirm latency, fast enough
     // to catch a quick "pon" (~200 ms press) while still rejecting single-
     // sample jitter. Was 200 ms polling -> 400 ms confirm, which silently
@@ -1141,11 +1141,14 @@ private:
 
     void ServoWobbleStepAdvance() {
         const int A = SERVO_WOBBLE_AMPLITUDE_DEG;
+        // Nuzzle motion: tilt head UP (positive pitch) then back down,
+        // like the robot is nuzzling into your hand.  Original code
+        // wobbled in yaw (left-right); changed to pitch for 丞丞.
         switch (servo_wobble_step_) {
-            case 0: WriteHeadAngles(-A, 0, SERVO_WOBBLE_STEP_MS); break;
-            case 1: WriteHeadAngles(+A, 0, SERVO_WOBBLE_STEP_MS); break;
-            case 2: WriteHeadAngles(-A, 0, SERVO_WOBBLE_STEP_MS); break;
-            case 3: WriteHeadAngles(  0, 0, SERVO_WOBBLE_STEP_MS); break;
+            case 0: WriteHeadAngles(0, +A,     SERVO_WOBBLE_STEP_MS); break;  // tilt up
+            case 1: WriteHeadAngles(0, +A + 5, SERVO_WOBBLE_STEP_MS); break;  // nuzzle higher
+            case 2: WriteHeadAngles(0, +A / 2, SERVO_WOBBLE_STEP_MS); break;  // ease down
+            case 3: WriteHeadAngles(0,  0,     SERVO_WOBBLE_STEP_MS); break;  // back to center
             default:
                 servo_wobble_active_ = false;
                 return;

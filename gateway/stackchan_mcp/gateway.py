@@ -88,8 +88,8 @@ class Gateway:
             vision_token=self.vision_token,
         )
 
-        # Start HTTP capture server
-        app = create_capture_app(capture_token=self.vision_token)
+        # Start HTTP capture server (with control endpoint wired to ESP32)
+        app = create_capture_app(capture_token=self.vision_token, esp32_mgr=self.esp32)
         self._http_runner = web.AppRunner(app)
         await self._http_runner.setup()
         site = web.TCPSite(self._http_runner, host, capture_port)
