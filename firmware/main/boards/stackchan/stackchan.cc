@@ -434,29 +434,39 @@ public:
             return false;
         }
 
-        // 1. Put the chip to sleep first so we get a clean recalibration
-        //    cycle when we wake it.
+        // 1. Put the chip to sleep so we get a clean recalibration on wake.
         SafeWriteReg(REG_CTRL, 0x07);            // SLEEP=1
         vTaskDelay(pdMS_TO_TICKS(50));
 
-        // 2. Set channel sensitivity.  Each register packs two channels
-        //    (high nibble = even CH, low nibble = odd CH). Range 0..F;
-        //    lower = MORE sensitive.  Default is typically 0x55.
-        //    We use 0x33 (fairly sensitive) for the StackChan head zones.
-        SafeWriteReg(REG_SENS1, 0x33);   // CH1, CH2
-        SafeWriteReg(REG_SENS2, 0x33);   // CH3, CH4
+        // 2. Set channel sensitivity to maximum.  The Si12T register layout
+        //    is not fully documented; try writing sensitivity to every
+        //    plausible register address (0x01-0x04) that various TSM12-
+        //    compatible datasheets list.  0x11 = both nibbles at '1'
+        //    (very sensitive, just above the minimum '0' which can cause
+        //    false positives on some boards).
+        for (uint8_t reg = 0x01; reg <= 0x04; reg++) {
+            SafeWriteReg(reg, 0x11);
+        }
 
         // 3. Wake the chip (clear SLEEP, keep bit1:0 = 11).
         if (!SafeWriteReg(REG_CTRL, 0x03)) {
             return false;
         }
 
-        // 4. Force reference recalibration on all channels. The sensor
-        //    re-measures the baseline capacitance after this write.
+        // 4. Force reference recalibration on all channels.
         SafeWriteReg(REG_REF_RST, 0xFF);
         vTaskDelay(pdMS_TO_TICKS(300));  // Wait for recalibration to settle
 
-        // 5. Read Output1 and record the boot baseline.  Any channels
+        // 5. Dump all readable registers for diagnostics.
+        ESP_LOGI("Si12T", "Register dump after recalibration:");
+        for (uint8_t reg = 0x00; reg <= 0x12; reg++) {
+            uint8_t val = 0;
+            if (SafeReadReg(reg, &val)) {
+                ESP_LOGI("Si12T", "  reg[0x%02X] = 0x%02X", reg, val);
+            }
+        }
+
+        // 6. Read Output1 and record the boot baseline.  Any channels
         //    that are "on" right after recalibration are considered stuck
         //    (e.g. physical coupling to the housing) and will be masked.
         uint8_t out1 = 0;
@@ -1369,6 +1379,13 @@ private:
         Si12T::TouchState s = si12t_->ReadTouchState();
         if (!s.ok) {
             return;
+        }
+        // Periodic raw-value diagnostic (every ~5 s = 50 polls at 100 ms).
+        static int diag_counter = 0;
+        if (++diag_counter >= 50) {
+            diag_counter = 0;
+            ESP_LOGI(TAG, "Si12T poll: raw=0x%02X z=%d%d%d",
+                     s.output1_raw, s.zone[0], s.zone[1], s.zone[2]);
         }
         // Snapshot for MCP visibility.
         last_output1_raw_ = s.output1_raw;
