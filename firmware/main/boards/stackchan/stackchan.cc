@@ -38,6 +38,8 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
 #include <esp_random.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -1875,6 +1877,147 @@ private:
         ESP_LOGI(TAG, "StackChan MCP tools registered");
     }
 
+    // ---- Claude.ai relay polling ----
+    // Periodically HTTP-GETs the relay server for commands queued by
+    // Claude.ai via MCP, then executes them locally (expression, servo,
+    // chat message). Runs on its own FreeRTOS task.
+
+    static constexpr const char* RELAY_POLL_URL =
+        "https://stackchan.xiaomemory.win/poll?token=sc-poll-Kx7mR9pQvW3nJ5tY";
+    static constexpr const char* RELAY_ACK_URL =
+        "https://stackchan.xiaomemory.win/ack?token=sc-poll-Kx7mR9pQvW3nJ5tY";
+    static constexpr int RELAY_POLL_INTERVAL_MS = 3000;
+    static constexpr int RELAY_HTTP_TIMEOUT_MS  = 10000;
+    static constexpr int RELAY_BUF_SIZE = 1024;
+
+    TaskHandle_t relay_task_ = nullptr;
+
+    static void RelayPollTaskEntry(void* arg) {
+        static_cast<StackChanBoard*>(arg)->RelayPollLoop();
+    }
+
+    void RelayPollLoop() {
+        vTaskDelay(pdMS_TO_TICKS(8000));
+        ESP_LOGI(TAG, "Relay polling started (%d ms interval)", RELAY_POLL_INTERVAL_MS);
+
+        while (true) {
+            RelayPollOnce();
+            vTaskDelay(pdMS_TO_TICKS(RELAY_POLL_INTERVAL_MS));
+        }
+    }
+
+    void RelayPollOnce() {
+        esp_http_client_config_t config = {};
+        config.url = RELAY_POLL_URL;
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.timeout_ms = RELAY_HTTP_TIMEOUT_MS;
+
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) return;
+
+        char buf[RELAY_BUF_SIZE] = {0};
+        int len = 0;
+
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err == ESP_OK) {
+            int content_len = esp_http_client_fetch_headers(client);
+            if (content_len > 0 && content_len < RELAY_BUF_SIZE) {
+                len = esp_http_client_read(client, buf, RELAY_BUF_SIZE - 1);
+                if (len > 0) buf[len] = '\0';
+            } else if (content_len < 0) {
+                len = esp_http_client_read(client, buf, RELAY_BUF_SIZE - 1);
+                if (len > 0) buf[len] = '\0';
+            }
+        } else {
+            ESP_LOGD(TAG, "Relay poll HTTP open failed: %s", esp_err_to_name(err));
+        }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        if (len <= 0) return;
+
+        cJSON* root = cJSON_Parse(buf);
+        if (!root) return;
+
+        cJSON* action_j = cJSON_GetObjectItem(root, "action");
+        if (!action_j || !cJSON_IsString(action_j)
+            || strcmp(action_j->valuestring, "none") == 0) {
+            cJSON_Delete(root);
+            return;
+        }
+
+        const char* action = action_j->valuestring;
+        cJSON* params = cJSON_GetObjectItem(root, "params");
+        cJSON* id_j = cJSON_GetObjectItem(root, "id");
+
+        ESP_LOGI(TAG, "Relay command: %s", action);
+        ExecuteRelayCommand(action, params);
+
+        if (id_j && cJSON_IsString(id_j)) {
+            RelayAck(id_j->valuestring);
+        }
+
+        cJSON_Delete(root);
+    }
+
+    void ExecuteRelayCommand(const char* action, cJSON* params) {
+        if (!display_) return;
+
+        if (strcmp(action, "emote") == 0) {
+            cJSON* expr = params ? cJSON_GetObjectItem(params, "expression") : nullptr;
+            if (expr && cJSON_IsString(expr)) {
+                display_->SetAvatarEmotion(expr->valuestring);
+            }
+        } else if (strcmp(action, "speak") == 0) {
+            cJSON* expr = params ? cJSON_GetObjectItem(params, "expression") : nullptr;
+            cJSON* text = params ? cJSON_GetObjectItem(params, "text") : nullptr;
+            if (expr && cJSON_IsString(expr)) {
+                display_->SetAvatarEmotion(expr->valuestring);
+            }
+            if (text && cJSON_IsString(text)) {
+                display_->SetChatMessage("assistant", text->valuestring);
+            }
+        } else if (strcmp(action, "move_head") == 0) {
+            cJSON* yaw_j   = params ? cJSON_GetObjectItem(params, "yaw") : nullptr;
+            cJSON* pitch_j = params ? cJSON_GetObjectItem(params, "pitch") : nullptr;
+            int yaw   = (yaw_j   && cJSON_IsNumber(yaw_j))   ? (int)yaw_j->valuedouble   : 0;
+            int pitch = (pitch_j && cJSON_IsNumber(pitch_j)) ? (int)pitch_j->valuedouble : 0;
+            WriteHeadAngles(yaw, pitch);
+        } else if (strcmp(action, "wiggle") == 0) {
+            StartServoWobble();
+        } else if (strcmp(action, "nuzzle") == 0) {
+            display_->OnPetted();
+            StartServoWobble();
+        } else {
+            ESP_LOGW(TAG, "Relay: unknown action '%s'", action);
+        }
+    }
+
+    void RelayAck(const char* cmd_id) {
+        char body[128];
+        snprintf(body, sizeof(body), "{\"id\":\"%s\"}", cmd_id);
+
+        esp_http_client_config_t config = {};
+        config.url = RELAY_ACK_URL;
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.timeout_ms = 5000;
+        config.method = HTTP_METHOD_POST;
+
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) return;
+
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, body, strlen(body));
+        esp_http_client_perform(client);
+        esp_http_client_cleanup(client);
+    }
+
+    void InitializeRelayPoll() {
+        xTaskCreate(&StackChanBoard::RelayPollTaskEntry, "relay_poll",
+                    8192, this, 5, &relay_task_);
+        ESP_LOGI(TAG, "Relay poll task created");
+    }
+
 public:
     StackChanBoard() {
         InitializePowerSaveTimer();
@@ -1899,6 +2042,7 @@ public:
         InitializeSi12tTouch();
         I2cDetect();
         RegisterMcpTools();
+        InitializeRelayPoll();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
