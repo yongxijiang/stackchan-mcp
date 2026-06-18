@@ -1,10 +1,8 @@
 """
-StackChan Relay — bridges Claude.ai MCP to ESP32 via command polling.
+StackChan Relay — bridges Claude.ai MCP to ESP32 via command polling + WebSocket TTS.
 
 Architecture:
-  Claude.ai --MCP/SSE--> this server --HTTP poll--> ESP32 StackChan
-
-Deploy on a VPS behind Cloudflare Tunnel (or any HTTPS reverse proxy).
+  Claude.ai --MCP/SSE--> this server --HTTP poll + WebSocket--> ESP32 StackChan
 """
 
 import asyncio
@@ -12,11 +10,13 @@ import json
 import logging
 import os
 import time
+import uuid
 
 import uvicorn
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
@@ -28,10 +28,16 @@ POLL_TOKEN = os.environ.get("POLL_TOKEN", "")
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8011"))
 
+# --- HTTP poll state (for non-audio commands) ---
 _cmd = None
 _cmd_lock = asyncio.Lock()
 _delivered_id = None
 _last_poll = 0.0
+
+# --- WebSocket state (for TTS audio) ---
+_esp32_ws = None
+_esp32_session_id = None
+_tts_queue = asyncio.Queue()
 
 EXPRESSIONS = (
     "neutral happy sad angry surprised loving embarrassed thinking "
@@ -49,11 +55,11 @@ async def list_tools():
     return [
         Tool(
             name="stackchan_speak",
-            description="Let StackChan display text with mouth animation.",
+            description="Let StackChan speak text aloud with TTS audio and display it on screen.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "Text to display/speak"},
+                    "text": {"type": "string", "description": "Text to speak"},
                     "expression": {
                         "type": "string",
                         "description": f"Optional face expression: {expr_list}",
@@ -75,7 +81,7 @@ async def list_tools():
         ),
         Tool(
             name="stackchan_move_head",
-            description="Rotate StackChan's head. yaw: left/right -30..30, pitch: up/down -20..20. 0,0 centers.",
+            description="Rotate StackChan's head. yaw: left/right -30..30, pitch: up/down -20..20.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -108,13 +114,16 @@ async def call_tool(name: str, arguments: dict):
 
     if name == "get_stackchan_status":
         now = time.time()
-        online = _last_poll > 0 and (now - _last_poll) < 30
+        poll_online = _last_poll > 0 and (now - _last_poll) < 30
+        ws_online = _esp32_ws is not None
         return [
             TextContent(
                 type="text",
                 text=json.dumps(
                     {
-                        "online": online,
+                        "online": poll_online or ws_online,
+                        "websocket_connected": ws_online,
+                        "tts_available": ws_online,
                         "seconds_since_last_poll": (
                             round(now - _last_poll) if _last_poll else None
                         ),
@@ -123,6 +132,24 @@ async def call_tool(name: str, arguments: dict):
                 ),
             )
         ]
+
+    if name == "stackchan_speak":
+        text = arguments.get("text", "")
+        expression = arguments.get("expression", "neutral")
+
+        if _esp32_ws is not None:
+            await _tts_queue.put({"text": text, "expression": expression})
+            return [TextContent(type="text", text=f"Speaking with TTS: {text}")]
+        else:
+            cmd = {
+                "action": "speak",
+                "params": arguments,
+                "id": f"cmd_{int(time.time() * 1000)}",
+            }
+            async with _cmd_lock:
+                _cmd = cmd
+                _delivered_id = None
+            return [TextContent(type="text", text=f"Text sent (no TTS — WebSocket not connected): {text}")]
 
     cmd = {
         "action": name.replace("stackchan_", ""),
@@ -134,6 +161,117 @@ async def call_tool(name: str, arguments: dict):
         _delivered_id = None
     logger.info("queued: %s", json.dumps(cmd, ensure_ascii=False))
     return [TextContent(type="text", text=f"Command sent: {cmd['action']}")]
+
+
+# ---- WebSocket gateway (xiaozhi protocol) ----
+
+
+async def tts_consumer(ws: WebSocket, session_id: str):
+    from tts_engine import text_to_opus_frames
+
+    while True:
+        req = await _tts_queue.get()
+        text = req.get("text", "")
+        expression = req.get("expression", "neutral")
+        if not text:
+            continue
+
+        try:
+            if expression:
+                await ws.send_text(json.dumps({
+                    "session_id": session_id,
+                    "type": "llm",
+                    "emotion": expression,
+                }))
+
+            await ws.send_text(json.dumps({
+                "session_id": session_id,
+                "type": "tts",
+                "state": "start",
+            }))
+            await ws.send_text(json.dumps({
+                "session_id": session_id,
+                "type": "tts",
+                "state": "sentence_start",
+                "text": text,
+            }))
+
+            frames = await text_to_opus_frames(text)
+            for frame in frames:
+                await ws.send_bytes(frame)
+                await asyncio.sleep(0.02)
+
+            await ws.send_text(json.dumps({
+                "session_id": session_id,
+                "type": "tts",
+                "state": "stop",
+            }))
+            logger.info("TTS done: '%s' (%d frames)", text[:30], len(frames))
+
+        except Exception as e:
+            logger.error("TTS send error: %s", e)
+            break
+
+
+async def handle_ws(websocket: WebSocket):
+    global _esp32_ws, _esp32_session_id
+
+    await websocket.accept()
+    logger.info("WebSocket connected from %s", websocket.client)
+
+    try:
+        hello_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
+        hello = json.loads(hello_raw)
+        logger.info("Client hello: %s", json.dumps(hello, ensure_ascii=False)[:200])
+
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        _esp32_session_id = session_id
+
+        server_hello = {
+            "type": "hello",
+            "transport": "websocket",
+            "session_id": session_id,
+            "audio_params": {
+                "sample_rate": 24000,
+                "frame_duration": 60,
+            },
+        }
+        await websocket.send_text(json.dumps(server_hello))
+        logger.info("Server hello sent, session=%s", session_id)
+
+        _esp32_ws = websocket
+
+        consumer_task = asyncio.create_task(tts_consumer(websocket, session_id))
+
+        try:
+            while True:
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                elif "text" in msg:
+                    data = json.loads(msg["text"])
+                    msg_type = data.get("type", "")
+                    if msg_type == "listen":
+                        logger.info("ESP32 listen: %s", data.get("state"))
+                    elif msg_type == "abort":
+                        logger.info("ESP32 abort")
+                    else:
+                        logger.debug("ESP32 msg: %s", msg_type)
+                elif "bytes" in msg:
+                    pass
+        finally:
+            consumer_task.cancel()
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected normally")
+    except asyncio.TimeoutError:
+        logger.warning("WebSocket hello timeout")
+    except Exception as e:
+        logger.error("WebSocket error: %s", e)
+    finally:
+        _esp32_ws = None
+        _esp32_session_id = None
+        logger.info("WebSocket session ended")
 
 
 # ---- HTTP endpoints ----
@@ -193,7 +331,12 @@ async def handle_ack(request):
 
 
 async def handle_health(request):
-    return JSONResponse({"status": "ok", "service": "stackchan-relay"})
+    return JSONResponse({
+        "status": "ok",
+        "service": "stackchan-relay",
+        "websocket_connected": _esp32_ws is not None,
+        "tts_available": _esp32_ws is not None,
+    })
 
 
 app = Starlette(
@@ -203,6 +346,7 @@ app = Starlette(
         Route("/messages/", handle_messages, methods=["POST"]),
         Route("/poll", handle_poll),
         Route("/ack", handle_ack, methods=["POST"]),
+        WebSocketRoute("/ws", handle_ws),
     ],
 )
 

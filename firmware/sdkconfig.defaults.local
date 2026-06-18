@@ -1,4 +1,4 @@
 # Local overrides for 丞丞's StackChan build
-# Force local gateway URL so OTA activation never overwrites it
+# Force relay WebSocket URL for TTS audio via Cloudflare Tunnel
 CONFIG_FORCE_DEFAULT_WEBSOCKET_URL=y
-CONFIG_DEFAULT_WEBSOCKET_URL="ws://192.168.2.61:8765/"
+CONFIG_DEFAULT_WEBSOCKET_URL="wss://stackchan.xiaomemory.win/ws"
