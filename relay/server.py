@@ -22,6 +22,10 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
 logger = logging.getLogger("stackchan-relay")
 
 POLL_TOKEN = os.environ.get("POLL_TOKEN", "")
@@ -75,6 +79,10 @@ async def list_tools():
                     "pitch": {
                         "type": "string",
                         "description": "Voice pitch, e.g. +0Hz, +5Hz, -10Hz",
+                    },
+                    "robot": {
+                        "type": "boolean",
+                        "description": "Apply robot/electronic voice effect (highpass + tremolo + echo)",
                     },
                 },
                 "required": ["text"],
@@ -151,10 +159,12 @@ async def call_tool(name: str, arguments: dict):
         voice = arguments.get("voice")
         rate = arguments.get("rate")
         pitch = arguments.get("pitch")
+        robot = arguments.get("robot", False)
 
         if _esp32_ws is not None:
             await _tts_queue.put({"text": text, "expression": expression,
-                                  "voice": voice, "rate": rate, "pitch": pitch})
+                                  "voice": voice, "rate": rate, "pitch": pitch,
+                                  "robot": robot})
             return [TextContent(type="text", text=f"Speaking with TTS: {text}")]
         else:
             cmd = {
@@ -183,7 +193,7 @@ async def call_tool(name: str, arguments: dict):
 
 
 async def tts_consumer(ws: WebSocket, session_id: str):
-    from tts_engine import text_to_opus_frames
+    from tts_engine import text_to_opus_frames, TTS_ENGINE
 
     while True:
         req = await _tts_queue.get()
@@ -192,6 +202,7 @@ async def tts_consumer(ws: WebSocket, session_id: str):
         voice = req.get("voice")
         rate = req.get("rate")
         pitch = req.get("pitch")
+        robot = req.get("robot", False)
         if not text:
             continue
 
@@ -215,21 +226,34 @@ async def tts_consumer(ws: WebSocket, session_id: str):
                 "text": text,
             }))
 
-            frames = await text_to_opus_frames(text, voice=voice, rate=rate, pitch=pitch)
-            # Burst first 5 frames to fill ESP32 decode buffer, then pace
-            burst = min(5, len(frames))
-            for frame in frames[:burst]:
-                await ws.send_bytes(frame)
-            for frame in frames[burst:]:
-                await asyncio.sleep(0.058)
-                await ws.send_bytes(frame)
+            if TTS_ENGINE == "fish":
+                frames = await text_to_opus_frames(text, voice=voice)
+                burst = min(30, len(frames))
+                for frame in frames[:burst]:
+                    await ws.send_bytes(frame)
+                pace_start = time.monotonic()
+                for i, frame in enumerate(frames[burst:]):
+                    target = pace_start + i * 0.050
+                    delay = target - time.monotonic()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    await ws.send_bytes(frame)
+                logger.info("TTS done: '%s' (%d frames, burst %d)", text[:30], len(frames), burst)
+            else:
+                frames = await text_to_opus_frames(text, voice=voice, rate=rate, pitch=pitch, robot=robot)
+                burst = min(10, len(frames))
+                for frame in frames[:burst]:
+                    await ws.send_bytes(frame)
+                for frame in frames[burst:]:
+                    await asyncio.sleep(0.055)
+                    await ws.send_bytes(frame)
+                logger.info("TTS done: '%s' (%d frames)", text[:30], len(frames))
 
             await ws.send_text(json.dumps({
                 "session_id": session_id,
                 "type": "tts",
                 "state": "stop",
             }))
-            logger.info("TTS done: '%s' (%d frames)", text[:30], len(frames))
 
         except WebSocketDisconnect:
             logger.warning("TTS consumer: WebSocket disconnected")
@@ -244,6 +268,14 @@ async def handle_ws(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connected from %s", websocket.client)
 
+    old_ws = _esp32_ws
+    if old_ws is not None:
+        logger.info("Closing previous WebSocket connection")
+        try:
+            await old_ws.close()
+        except Exception:
+            pass
+
     try:
         hello_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
         hello = json.loads(hello_raw)
@@ -257,7 +289,7 @@ async def handle_ws(websocket: WebSocket):
             "transport": "websocket",
             "session_id": session_id,
             "audio_params": {
-                "sample_rate": 24000,
+                "sample_rate": 16000,
                 "frame_duration": 60,
             },
         }
@@ -294,8 +326,9 @@ async def handle_ws(websocket: WebSocket):
     except Exception as e:
         logger.error("WebSocket error: %s", e)
     finally:
-        _esp32_ws = None
-        _esp32_session_id = None
+        if _esp32_ws is websocket:
+            _esp32_ws = None
+            _esp32_session_id = None
         logger.info("WebSocket session ended")
 
 
@@ -314,12 +347,18 @@ async def handle_sse(request):
             write_stream,
             mcp_server.create_initialization_options(),
         )
+    return Response()
 
+
+class _AlreadySent(Response):
+    async def __call__(self, scope, receive, send):
+        pass
 
 async def handle_messages(request):
     await sse.handle_post_message(
         request.scope, request.receive, request._send
     )
+    return _AlreadySent()
 
 
 async def handle_poll(request):
@@ -376,9 +415,5 @@ app = Starlette(
 )
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
     logger.info("Starting StackChan relay on port %d", PORT)
     uvicorn.run(app, host="127.0.0.1", port=PORT)
