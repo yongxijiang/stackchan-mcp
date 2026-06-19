@@ -62,6 +62,7 @@ WebsocketProtocol::WebsocketProtocol() {
                 ESP_LOGI(TAG, "Reconnecting to websocket server");
                 if (!protocol->OpenAudioChannelInternal(false)) {
                     ESP_LOGW(TAG, "Reconnect attempt failed; rescheduling");
+                    protocol->intentional_close_.store(false);
                     protocol->ScheduleReconnect();
                 }
             });
