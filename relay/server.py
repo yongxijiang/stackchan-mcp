@@ -42,6 +42,7 @@ _last_poll = 0.0
 _esp32_ws = None
 _esp32_session_id = None
 _tts_queue = asyncio.Queue()
+_tts_config = {"burst": 15, "pace": 0.060}
 
 EXPRESSIONS = (
     "neutral happy sad angry surprised loving embarrassed thinking "
@@ -228,12 +229,12 @@ async def tts_consumer(ws: WebSocket, session_id: str):
 
             if TTS_ENGINE == "fish":
                 frames = await text_to_opus_frames(text, voice=voice)
-                burst = min(30, len(frames))
+                burst = min(_tts_config["burst"], len(frames))
                 for frame in frames[:burst]:
                     await ws.send_bytes(frame)
                 pace_start = time.monotonic()
                 for i, frame in enumerate(frames[burst:]):
-                    target = pace_start + i * 0.050
+                    target = pace_start + i * _tts_config["pace"]
                     delay = target - time.monotonic()
                     if delay > 0:
                         await asyncio.sleep(delay)
@@ -394,6 +395,23 @@ async def handle_ack(request):
     return JSONResponse({"ok": True})
 
 
+async def handle_tts_config(request):
+    global _tts_config
+    if request.method == "GET":
+        return JSONResponse({"burst": _tts_config["burst"], "pace": _tts_config["pace"],
+                             "websocket_connected": _esp32_ws is not None})
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if "burst" in body:
+        _tts_config["burst"] = int(body["burst"])
+    if "pace" in body:
+        _tts_config["pace"] = float(body["pace"])
+    logger.info("TTS config updated: burst=%d pace=%.3f", _tts_config["burst"], _tts_config["pace"])
+    return JSONResponse({"burst": _tts_config["burst"], "pace": _tts_config["pace"]})
+
+
 async def handle_health(request):
     return JSONResponse({
         "status": "ok",
@@ -406,6 +424,7 @@ async def handle_health(request):
 app = Starlette(
     routes=[
         Route("/health", handle_health),
+        Route("/tts-config", handle_tts_config, methods=["GET", "POST"]),
         Route("/sse", handle_sse),
         Route("/messages/", handle_messages, methods=["POST"]),
         Route("/poll", handle_poll),
