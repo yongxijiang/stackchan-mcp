@@ -64,6 +64,18 @@ async def list_tools():
                         "type": "string",
                         "description": f"Optional face expression: {expr_list}",
                     },
+                    "voice": {
+                        "type": "string",
+                        "description": "TTS voice name, e.g. zh-CN-YunxiNeural, zh-CN-XiaoxiaoNeural, zh-CN-YunyangNeural, zh-CN-XiaoyiNeural",
+                    },
+                    "rate": {
+                        "type": "string",
+                        "description": "Speech rate, e.g. +0%, +10%, +20%, -5%",
+                    },
+                    "pitch": {
+                        "type": "string",
+                        "description": "Voice pitch, e.g. +0Hz, +5Hz, -10Hz",
+                    },
                 },
                 "required": ["text"],
             },
@@ -136,9 +148,13 @@ async def call_tool(name: str, arguments: dict):
     if name == "stackchan_speak":
         text = arguments.get("text", "")
         expression = arguments.get("expression", "neutral")
+        voice = arguments.get("voice")
+        rate = arguments.get("rate")
+        pitch = arguments.get("pitch")
 
         if _esp32_ws is not None:
-            await _tts_queue.put({"text": text, "expression": expression})
+            await _tts_queue.put({"text": text, "expression": expression,
+                                  "voice": voice, "rate": rate, "pitch": pitch})
             return [TextContent(type="text", text=f"Speaking with TTS: {text}")]
         else:
             cmd = {
@@ -173,6 +189,9 @@ async def tts_consumer(ws: WebSocket, session_id: str):
         req = await _tts_queue.get()
         text = req.get("text", "")
         expression = req.get("expression", "neutral")
+        voice = req.get("voice")
+        rate = req.get("rate")
+        pitch = req.get("pitch")
         if not text:
             continue
 
@@ -196,10 +215,14 @@ async def tts_consumer(ws: WebSocket, session_id: str):
                 "text": text,
             }))
 
-            frames = await text_to_opus_frames(text)
-            for frame in frames:
+            frames = await text_to_opus_frames(text, voice=voice, rate=rate, pitch=pitch)
+            # Burst first 5 frames to fill ESP32 decode buffer, then pace
+            burst = min(5, len(frames))
+            for frame in frames[:burst]:
                 await ws.send_bytes(frame)
-                await asyncio.sleep(0.02)
+            for frame in frames[burst:]:
+                await asyncio.sleep(0.058)
+                await ws.send_bytes(frame)
 
             await ws.send_text(json.dumps({
                 "session_id": session_id,
@@ -208,9 +231,11 @@ async def tts_consumer(ws: WebSocket, session_id: str):
             }))
             logger.info("TTS done: '%s' (%d frames)", text[:30], len(frames))
 
-        except Exception as e:
-            logger.error("TTS send error: %s", e)
+        except WebSocketDisconnect:
+            logger.warning("TTS consumer: WebSocket disconnected")
             break
+        except Exception as e:
+            logger.error("TTS send error (skipping): %s", e)
 
 
 async def handle_ws(websocket: WebSocket):

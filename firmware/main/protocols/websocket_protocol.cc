@@ -92,8 +92,18 @@ WebsocketProtocol::~WebsocketProtocol() {
 }
 
 bool WebsocketProtocol::Start() {
-    // Connect immediately so the relay gateway can push TTS at any time
-    return OpenAudioChannelInternal(false);
+    // Connect immediately so the relay gateway can push TTS at any time.
+    // If the initial attempt fails (server unreachable, network not ready),
+    // schedule exponential-backoff retries so we don't stay offline forever.
+    // OpenAudioChannelInternal sets intentional_close_=true at entry to guard
+    // against the old socket's disconnect handler; clear it before retrying.
+    if (!OpenAudioChannelInternal(false)) {
+        ESP_LOGW(TAG, "Initial WebSocket connect failed; scheduling retry");
+        intentional_close_.store(false);
+        ScheduleReconnect();
+        return false;
+    }
+    return true;
 }
 
 bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
