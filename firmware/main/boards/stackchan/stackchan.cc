@@ -73,6 +73,11 @@ public:
         brightness = ((brightness + 641) >> 5);
         WriteReg(0x99, brightness);
     }
+
+    // Raw PMU status for serial diagnostics (0x00: VBUS/thermal state,
+    // 0x01: battery current direction + charge phase).
+    uint8_t PmuStatus1() { return ReadReg(0x00); }
+    uint8_t PmuStatus2() { return ReadReg(0x01); }
 };
 
 class CustomBacklight : public Backlight {
@@ -421,7 +426,9 @@ public:
 
     struct TouchState {
         bool zone[3];          // CH1, CH2, CH3 — true if any output level set
-        uint8_t output1_raw;   // raw Output1 register byte (0x10)
+        uint8_t output1_raw;   // raw Output1 register byte (0x10, CH1-4)
+        uint8_t output2_raw;   // raw Output2 register byte (0x11, CH5-8)
+        uint8_t output3_raw;   // raw Output3 register byte (0x12, CH9-12)
         bool ok;               // false if the I2C read failed
     };
 
@@ -440,13 +447,15 @@ public:
         SafeWriteReg(REG_CTRL, 0x07);            // SLEEP=1
         vTaskDelay(pdMS_TO_TICKS(50));
 
-        // 2. Set channel sensitivity to maximum.  The Si12T register layout
-        //    is not fully documented; try writing sensitivity to every
-        //    plausible register address (0x01-0x04) that various TSM12-
-        //    compatible datasheets list.  0x11 = both nibbles at '1'
-        //    (very sensitive, just above the minimum '0' which can cause
-        //    false positives on some boards).
-        for (uint8_t reg = 0x01; reg <= 0x04; reg++) {
+        // 2. Set channel sensitivity to maximum.  Register-dump evidence
+        //    (2026-07-06 live capture): 0x01 is not writable — it reads back
+        //    0x68 (device-address echo) even after a write, while 0x05-0x07
+        //    still held the factory default 0xBB when only 0x01-0x04 were
+        //    written.  So sensitivity lives in 0x02-0x07: six registers,
+        //    one nibble per channel, 12 channels total.  0x11 = both
+        //    nibbles at '1' (very sensitive, just above the minimum '0'
+        //    which can cause false positives on some boards).
+        for (uint8_t reg = REG_SENS_FIRST; reg <= REG_SENS_LAST; reg++) {
             SafeWriteReg(reg, 0x11);
         }
 
@@ -494,6 +503,12 @@ public:
         if (!SafeReadReg(REG_OUTPUT1, &s.output1_raw)) {
             return s;
         }
+        // Output2/Output3 cover CH5-12.  The head electrodes were assumed to
+        // sit on CH1-3, but live captures show Output1 stays 0x00 under real
+        // touches, so read all three banks to locate the actual channels.
+        // Failures here are non-fatal: zone detection still runs on Output1.
+        SafeReadReg(REG_OUTPUT2, &s.output2_raw);
+        SafeReadReg(REG_OUTPUT3, &s.output3_raw);
         s.ok = true;
         // Mask out channels that were "on" at boot (stuck / housing-coupled).
         uint8_t effective = s.output1_raw & ~boot_baseline_;
@@ -507,11 +522,13 @@ public:
     uint8_t boot_baseline() const { return boot_baseline_; }
 
 private:
-    static constexpr uint8_t REG_SENS1   = 0x02;  // Sensitivity CH1+CH2
-    static constexpr uint8_t REG_SENS2   = 0x03;  // Sensitivity CH3+CH4
+    static constexpr uint8_t REG_SENS_FIRST = 0x02;  // Sensitivity CH1+CH2
+    static constexpr uint8_t REG_SENS_LAST  = 0x07;  // ... through CH11+CH12
     static constexpr uint8_t REG_CTRL    = 0x09;  // CTRL, SLEEP bit etc.
     static constexpr uint8_t REG_REF_RST = 0x0A;  // Reference reset (recalib)
     static constexpr uint8_t REG_OUTPUT1 = 0x10;  // CH1..CH4 packed (2bpp)
+    static constexpr uint8_t REG_OUTPUT2 = 0x11;  // CH5..CH8 packed (2bpp)
+    static constexpr uint8_t REG_OUTPUT3 = 0x12;  // CH9..CH12 packed (2bpp)
     uint8_t boot_baseline_ = 0;                   // channels stuck at boot
 
     bool SafeReadReg(uint8_t reg, uint8_t* out) {
@@ -576,11 +593,14 @@ private:
     // to catch a quick "pon" (~200 ms press) while still rejecting single-
     // sample jitter. Was 200 ms polling -> 400 ms confirm, which silently
     // dropped most short taps.
-    static constexpr int SERVO_WOBBLE_STEP_MS = 350;  // was 200; SCS0009 needs
-                                                       // ~125 ms to physically
-                                                       // travel ±20°, plus the
-                                                       // ACK round-trip + IFG.
-                                                       // Tighter steps caused
+    static constexpr int SERVO_WOBBLE_STEP_MS = 550;  // Gentle nuzzle pace:
+                                                       // 6 steps x 550 ms ≈
+                                                       // 3.3 s total. Floor is
+                                                       // ~350 ms — SCS0009
+                                                       // needs ~125 ms to
+                                                       // travel ±20° plus ACK
+                                                       // round-trip + IFG;
+                                                       // tighter steps caused
                                                        // bus hangs.
     static constexpr int SERVO_WOBBLE_AMPLITUDE_DEG = 20;
 
@@ -671,7 +691,10 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // Dim after 5 min idle; never auto power-off (-1).  The previous
+        // (60, 300) config hard-cut power via pmic_->PowerOff() after five
+        // silent minutes — a companion robot must stay alive while idle.
+        power_save_timer_ = new PowerSaveTimer(-1, 300, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(10);
@@ -1135,20 +1158,22 @@ private:
 
     void ServoWobbleStepAdvance() {
         const int A = SERVO_WOBBLE_AMPLITUDE_DEG;
-        // Nuzzle motion: tilt head UP (positive pitch) then back down,
-        // like the robot is nuzzling into your hand.  Original code
+        // Nuzzle motion: pitch-led lean-in with a faint yaw sway, then a slow
+        // settle — like nuzzling into a hand, not nodding.  Original code
         // wobbled in yaw (left-right); changed to pitch for 丞丞.
         switch (servo_wobble_step_) {
-            case 0: WriteHeadAngles(0, +A,     SERVO_WOBBLE_STEP_MS); break;  // tilt up
-            case 1: WriteHeadAngles(0, +A + 5, SERVO_WOBBLE_STEP_MS); break;  // nuzzle higher
-            case 2: WriteHeadAngles(0, +A / 2, SERVO_WOBBLE_STEP_MS); break;  // ease down
-            case 3: WriteHeadAngles(0,  0,     SERVO_WOBBLE_STEP_MS); break;  // back to center
+            case 0: WriteHeadAngles(-3, +A * 3 / 5, SERVO_WOBBLE_STEP_MS); break;  // lean in
+            case 1: WriteHeadAngles(+2, +A,         SERVO_WOBBLE_STEP_MS); break;  // nuzzle up
+            case 2: WriteHeadAngles(-2, +A + 5,     SERVO_WOBBLE_STEP_MS); break;  // deepest press
+            case 3: WriteHeadAngles(+3, +A * 4 / 5, SERVO_WOBBLE_STEP_MS); break;  // linger
+            case 4: WriteHeadAngles( 0, +A * 2 / 5, SERVO_WOBBLE_STEP_MS); break;  // ease down
+            case 5: WriteHeadAngles( 0, 0,          SERVO_WOBBLE_STEP_MS); break;  // settle
             default:
                 servo_wobble_active_ = false;
                 return;
         }
         servo_wobble_step_++;
-        if (servo_wobble_step_ <= 3) {
+        if (servo_wobble_step_ <= 5) {
             esp_timer_start_once(servo_wobble_timer_,
                                  (uint64_t)SERVO_WOBBLE_STEP_MS * 1000);
         } else {
@@ -1338,11 +1363,28 @@ private:
             return;
         }
         // Periodic raw-value diagnostic (every ~5 s = 50 polls at 100 ms).
+        // Any nonzero bank is logged immediately (10 Hz worst case) so touch
+        // events are visible live over serial; the quiet 5 s heartbeat keeps
+        // proving the poll loop is alive.  Battery/PMU state rides on the
+        // heartbeat to diagnose the on-USB discharge behaviour.
+        bool any_channel = s.output1_raw || s.output2_raw || s.output3_raw;
         static int diag_counter = 0;
+        if (any_channel) {
+            ESP_LOGI(TAG, "Si12T TOUCH: out=[0x%02X 0x%02X 0x%02X] z=%d%d%d",
+                     s.output1_raw, s.output2_raw, s.output3_raw,
+                     s.zone[0], s.zone[1], s.zone[2]);
+        }
         if (++diag_counter >= 50) {
             diag_counter = 0;
-            ESP_LOGI(TAG, "Si12T poll: raw=0x%02X z=%d%d%d",
-                     s.output1_raw, s.zone[0], s.zone[1], s.zone[2]);
+            ESP_LOGI(TAG, "Si12T poll: out=[0x%02X 0x%02X 0x%02X] z=%d%d%d",
+                     s.output1_raw, s.output2_raw, s.output3_raw,
+                     s.zone[0], s.zone[1], s.zone[2]);
+            if (pmic_) {
+                ESP_LOGI(TAG, "Power: soc=%d%% chg=%d dis=%d pmu=[0x%02X 0x%02X]",
+                         pmic_->GetBatteryLevel(), pmic_->IsCharging(),
+                         pmic_->IsDischarging(), pmic_->PmuStatus1(),
+                         pmic_->PmuStatus2());
+            }
         }
         // Snapshot for MCP visibility.
         last_output1_raw_ = s.output1_raw;
