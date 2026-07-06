@@ -45,6 +45,11 @@ public:
     // Returns 1 if the servo is still moving, 0 if at rest, -1 on bus error.
     int ReadMove(uint8_t id);
 
+    // ---- Health telemetry (all return -1 on bus error) -------------------
+    int ReadLoad(uint8_t id);     // raw present load; bit 10 = direction
+    int ReadVoltage(uint8_t id);  // unit 0.1 V
+    int ReadTemper(uint8_t id);   // unit 1 °C
+
     // ---- Torque ---------------------------------------------------------
     int EnableTorque(uint8_t id, uint8_t enable);
     int ReadToqueEnable(uint8_t id);  // typo preserved for SCSCL API parity

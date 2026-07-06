@@ -21,6 +21,9 @@ constexpr uint8_t REG_TORQUE_ENABLE    = 40;  // 0x28
 constexpr uint8_t REG_GOAL_POSITION_L  = 42;  // 0x2A — followed by H, time L/H, speed L/H
 constexpr uint8_t REG_GOAL_SPEED_L     = 46;  // 0x2E — also PWM target in PWM mode
 constexpr uint8_t REG_PRESENT_POSITION_L = 56;  // 0x38
+constexpr uint8_t REG_PRESENT_LOAD_L   = 60;  // 0x3C — followed by H; bit 10 = direction
+constexpr uint8_t REG_PRESENT_VOLTAGE  = 62;  // 0x3E — unit 0.1 V
+constexpr uint8_t REG_PRESENT_TEMPERATURE = 63;  // 0x3F — unit 1 °C
 constexpr uint8_t REG_MOVING           = 66;  // 0x42
 
 // Protocol instruction codes.
@@ -194,6 +197,28 @@ int FeetechScs::ReadMove(uint8_t id)
     uint8_t b;
     if (read_reg(id, REG_MOVING, 1, &b) != 0) return -1;
     return b;
+}
+
+int FeetechScs::ReadLoad(uint8_t id)
+{
+    uint8_t b[2];
+    if (read_reg(id, REG_PRESENT_LOAD_L, 2, b) != 0) return -1;
+    // Big-endian like position; raw value, bit 10 = direction flag.
+    return (b[0] << 8) | b[1];
+}
+
+int FeetechScs::ReadVoltage(uint8_t id)
+{
+    uint8_t b;
+    if (read_reg(id, REG_PRESENT_VOLTAGE, 1, &b) != 0) return -1;
+    return b;  // unit 0.1 V
+}
+
+int FeetechScs::ReadTemper(uint8_t id)
+{
+    uint8_t b;
+    if (read_reg(id, REG_PRESENT_TEMPERATURE, 1, &b) != 0) return -1;
+    return b;  // unit 1 °C
 }
 
 int FeetechScs::EnableTorque(uint8_t id, uint8_t enable)
