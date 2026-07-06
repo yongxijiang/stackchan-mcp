@@ -649,6 +649,7 @@ private:
     SemaphoreHandle_t motion_mutex_ = nullptr;     // protects AxisMotion fields
     SemaphoreHandle_t scs_bus_mutex_ = nullptr;    // serializes UART access (WritePos/ReadPos)
     TaskHandle_t servo_task_handle_ = nullptr;
+    uint32_t servo_check_last_ms_ = 0;   // next idle health-check scheduling
     static constexpr uint32_t MOTION_TICK_MS = 20;
     static constexpr uint32_t MOTION_DEFAULT_DURATION_MS = 600;
     static constexpr uint32_t MOTION_PER_WRITE_TIME_MS = 30;
@@ -1224,7 +1225,35 @@ private:
             pitch_local = pitch_motion_;
             xSemaphoreGive(motion_mutex_);
 
-            if (!yaw_local.moving && !pitch_local.moving) continue;
+            if (!yaw_local.moving && !pitch_local.moving) {
+                // Idle-time servo health check: voltage/load/temp/position from
+                // both servos answer "under-powered vs mechanically slipping"
+                // without a multimeter.  Runs every 10 s while the bus is quiet;
+                // a completed motion reschedules it to ~300 ms after the move
+                // so each line doubles as an arrival check (commanded vs actual).
+                uint32_t idle_now = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+                if (idle_now - servo_check_last_ms_ >= 10000) {
+                    servo_check_last_ms_ = idle_now;
+                    xSemaphoreTake(scs_bus_mutex_, portMAX_DELAY);
+                    int y_pos = scs_bus_.ReadPos(SERVO_YAW_ID);
+                    int y_v   = scs_bus_.ReadVoltage(SERVO_YAW_ID);
+                    int y_l   = scs_bus_.ReadLoad(SERVO_YAW_ID);
+                    int y_t   = scs_bus_.ReadTemper(SERVO_YAW_ID);
+                    vTaskDelay(kInterFrameGap);
+                    int p_pos = scs_bus_.ReadPos(SERVO_PITCH_ID);
+                    int p_v   = scs_bus_.ReadVoltage(SERVO_PITCH_ID);
+                    int p_l   = scs_bus_.ReadLoad(SERVO_PITCH_ID);
+                    int p_t   = scs_bus_.ReadTemper(SERVO_PITCH_ID);
+                    xSemaphoreGive(scs_bus_mutex_);
+                    ESP_LOGI(TAG, "Servo check: yaw(id%d) pos=%d volt=%d load=%d temp=%d"
+                                  " | pitch(id%d) pos=%d volt=%d load=%d temp=%d"
+                                  " (volt x0.1V; cmd yaw_deg=%d pitch_deg=%d)",
+                             SERVO_YAW_ID, y_pos, y_v, y_l, y_t,
+                             SERVO_PITCH_ID, p_pos, p_v, p_l, p_t,
+                             yaw_local.current_deg, pitch_local.current_deg);
+                }
+                continue;
+            }
 
             uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
 
@@ -1275,6 +1304,13 @@ private:
                 }
             }
             xSemaphoreGive(scs_bus_mutex_);
+
+            // A move that just completed schedules a health check ~300 ms out,
+            // turning the next check line into an arrival audit for that move.
+            if ((yaw_local.moving && !new_yaw_moving) ||
+                (pitch_local.moving && !new_pitch_moving)) {
+                servo_check_last_ms_ = now_ms - 9700;
+            }
 
             xSemaphoreTake(motion_mutex_, portMAX_DELAY);
             if (yaw_motion_.move_start_ms == yaw_local.move_start_ms) {
