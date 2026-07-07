@@ -66,7 +66,7 @@
 #define SERVO_BAUDRATE 1000000
 #define SERVO_TX_PIN 6
 #define SERVO_RX_PIN 7
-#define SERVO_YAW_ID 1
-#define SERVO_PITCH_ID 2
+#define SERVO_YAW_ID 2
+#define SERVO_PITCH_ID 1
 
 #endif // _BOARD_CONFIG_H_

@@ -62,6 +62,7 @@ WebsocketProtocol::WebsocketProtocol() {
                 ESP_LOGI(TAG, "Reconnecting to websocket server");
                 if (!protocol->OpenAudioChannelInternal(false)) {
                     ESP_LOGW(TAG, "Reconnect attempt failed; rescheduling");
+                    protocol->intentional_close_.store(false);
                     protocol->ScheduleReconnect();
                 }
             });
@@ -92,7 +93,17 @@ WebsocketProtocol::~WebsocketProtocol() {
 }
 
 bool WebsocketProtocol::Start() {
-    // Only connect to server when audio channel is needed
+    // Connect immediately so the relay gateway can push TTS at any time.
+    // If the initial attempt fails (server unreachable, network not ready),
+    // schedule exponential-backoff retries so we don't stay offline forever.
+    // OpenAudioChannelInternal sets intentional_close_=true at entry to guard
+    // against the old socket's disconnect handler; clear it before retrying.
+    if (!OpenAudioChannelInternal(false)) {
+        ESP_LOGW(TAG, "Initial WebSocket connect failed; scheduling retry");
+        intentional_close_.store(false);
+        ScheduleReconnect();
+        return false;
+    }
     return true;
 }
 
@@ -147,18 +158,9 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 }
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
-    (void)send_goodbye;  // Websocket doesn't need to send goodbye message
-    // Mark the close as intentional so any reconnect job already
-    // re-posted from the timer callback aborts when it runs on the main
-    // task, then disarm the current socket's per-socket flag so the
-    // OnDisconnected lambda hits the early-return guard the moment the
-    // underlying close fires (the lambda runs on the WS task).
-    intentional_close_.store(true);
-    if (current_notify_disconnect_) {
-        current_notify_disconnect_->store(false);
-    }
-    StopReconnectTimer();
-    websocket_.reset();
+    (void)send_goodbye;
+    // Keep WebSocket alive for server-initiated TTS pushes.
+    // Actual teardown happens via the destructor (protocol_.reset()).
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {

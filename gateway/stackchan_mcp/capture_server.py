@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 CAPTURE_DIR = os.path.expanduser("~/.stackchan/captures")
 CAPTURE_TOKEN_KEY = web.AppKey("capture_token", str)
+ESP32_MGR_KEY = web.AppKey("esp32_mgr", object)
 
 
 def _is_authorized(auth_header: str, expected_token: str) -> bool:
@@ -83,9 +84,94 @@ async def handle_capture(request: web.Request) -> web.Response:
     )
 
 
-def create_capture_app(capture_token: str = "") -> web.Application:
+async def handle_control(request: web.Request) -> web.Response:
+    """HTTP control endpoint — lets external callers invoke ESP32 tools.
+
+    POST /control  {"tool": "self.set_head_angles", "arguments": {"yaw": 30}}
+    Returns the ESP32 response JSON.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(
+            text='{"error": "invalid JSON"}',
+            status=400,
+            content_type="application/json",
+        )
+
+    tool = body.get("tool", "")
+    arguments = body.get("arguments", {})
+    if not tool:
+        return web.Response(
+            text='{"error": "missing tool field"}',
+            status=400,
+            content_type="application/json",
+        )
+
+    esp32_mgr = request.app.get(ESP32_MGR_KEY)
+    if esp32_mgr is None:
+        return web.Response(
+            text='{"error": "gateway not initialised"}',
+            status=503,
+            content_type="application/json",
+        )
+
+    conn = esp32_mgr.connection
+    if conn is None or not conn.connected:
+        return web.Response(
+            text='{"error": "ESP32 not connected"}',
+            status=503,
+            content_type="application/json",
+        )
+
+    logger.info("Control: %s(%s)", tool, json.dumps(arguments, ensure_ascii=False))
+    result, error = await conn.call_tool(tool, arguments)
+    if error:
+        return web.Response(
+            text=json.dumps({"error": error}, ensure_ascii=False),
+            status=502,
+            content_type="application/json",
+        )
+    return web.Response(
+        text=json.dumps({"result": result}, ensure_ascii=False),
+        content_type="application/json",
+    )
+
+
+async def handle_ota_stub(request: web.Request) -> web.Response:
+    """Stub OTA/activation endpoint.
+
+    When the ESP32 firmware's ``ota_url`` NVS key points at this server,
+    the device contacts us instead of ``api.tenclass.net`` during boot.
+    Returning an empty JSON object means:
+    - no ``websocket`` section → NVS websocket.url is **not** overwritten
+    - no ``activation`` section → boot proceeds immediately (no challenge)
+    - no ``firmware`` section → no OTA upgrade triggered
+
+    This lets the user-configured ``websocket.url`` in NVS survive reboots.
+    """
+    logger.info(
+        "OTA stub: %s %s (User-Agent: %s)",
+        request.method,
+        request.path,
+        request.headers.get("User-Agent", "?"),
+    )
+    return web.Response(
+        text="{}",
+        content_type="application/json",
+    )
+
+
+def create_capture_app(capture_token: str = "", esp32_mgr: object | None = None) -> web.Application:
     """Create the HTTP capture application."""
     app = web.Application()
     app[CAPTURE_TOKEN_KEY] = capture_token
+    if esp32_mgr is not None:
+        app[ESP32_MGR_KEY] = esp32_mgr
     app.router.add_post("/capture", handle_capture)
+    app.router.add_post("/control", handle_control)
+    # OTA stub: accept any path the firmware might hit during activation.
+    # Routes are tried in registration order, so /capture and /control win;
+    # everything else falls through to the stub.
+    app.router.add_route("*", "/{path:.*}", handle_ota_stub)
     return app

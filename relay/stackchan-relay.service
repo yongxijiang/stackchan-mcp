@@ -1,0 +1,15 @@
+[Unit]
+Description=StackChan Relay (MCP bridge for Claude.ai → ESP32)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/stackchan-relay
+EnvironmentFile=/opt/stackchan-relay/.env
+ExecStart=/opt/stackchan-relay/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8011
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

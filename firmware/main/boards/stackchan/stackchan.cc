@@ -27,7 +27,7 @@ using ScsBus = SCSCL;
 // Treat ACK timeout as failure to keep the original behaviour intact.
 static inline bool ServoWritePosOk(int r) { return r > 0; }
 #endif
-#include "avatar_images.h"
+#include "stackchan_avatar.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -38,6 +38,8 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
 #include <esp_random.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -72,6 +74,11 @@ public:
         brightness = ((brightness + 641) >> 5);
         WriteReg(0x99, brightness);
     }
+
+    // Raw PMU status for serial diagnostics (0x00: VBUS/thermal state,
+    // 0x01: battery current direction + charge phase).
+    uint8_t PmuStatus1() { return ReadReg(0x00); }
+    uint8_t PmuStatus2() { return ReadReg(0x01); }
 };
 
 class CustomBacklight : public Backlight {
@@ -420,26 +427,60 @@ public:
 
     struct TouchState {
         bool zone[3];          // CH1, CH2, CH3 — true if any output level set
-        uint8_t output1_raw;   // raw Output1 register byte (0x10)
+        uint8_t output1_raw;   // raw Output1 register byte (0x10, CH1-4)
+        uint8_t output2_raw;   // raw Output2 register byte (0x11, CH5-8)
+        uint8_t output3_raw;   // raw Output3 register byte (0x12, CH9-12)
         bool ok;               // false if the I2C read failed
     };
 
     Si12T(i2c_master_bus_handle_t i2c_bus, uint8_t addr = DEFAULT_ADDR)
         : I2cDevice(i2c_bus, addr) {}
 
-    // Probe the chip and bring it out of sleep. Returns true on success.
+    // Probe the chip, configure sensitivity, force recalibration, and bring
+    // it into normal sensing mode.  Returns true on success.
     bool Begin() {
         uint8_t ctrl = 0;
         if (!SafeReadReg(REG_CTRL, &ctrl)) {
             return false;
         }
-        // CTRL bit1 = SLEEP. Clear it; bit1:0 must hold 1 per datasheet
-        // ("CTRL Bit1, Bit0 = 1 1" reset value), so write 0b00000011.
+
+        // 1. Put the chip to sleep so we get a clean recalibration on wake.
+        SafeWriteReg(REG_CTRL, 0x07);            // SLEEP=1
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // 2. Set channel sensitivity to maximum.  Register-dump evidence
+        //    (2026-07-06 live capture): 0x01 is not writable — it reads back
+        //    0x68 (device-address echo) even after a write, while 0x05-0x07
+        //    still held the factory default 0xBB when only 0x01-0x04 were
+        //    written.  So sensitivity lives in 0x02-0x07: six registers,
+        //    one nibble per channel, 12 channels total.  0x11 = both
+        //    nibbles at '1' (very sensitive, just above the minimum '0'
+        //    which can cause false positives on some boards).
+        for (uint8_t reg = REG_SENS_FIRST; reg <= REG_SENS_LAST; reg++) {
+            SafeWriteReg(reg, 0x11);
+        }
+
+        // 3. Wake the chip (clear SLEEP, keep bit1:0 = 11).
         if (!SafeWriteReg(REG_CTRL, 0x03)) {
             return false;
         }
-        // Verify the device actually responds on the output register.
-        // 0xFF would indicate an open bus / no device.
+
+        // 4. Force reference recalibration on all channels.
+        SafeWriteReg(REG_REF_RST, 0xFF);
+        vTaskDelay(pdMS_TO_TICKS(300));  // Wait for recalibration to settle
+
+        // 5. Dump all readable registers for diagnostics.
+        ESP_LOGI("Si12T", "Register dump after recalibration:");
+        for (uint8_t reg = 0x00; reg <= 0x12; reg++) {
+            uint8_t val = 0;
+            if (SafeReadReg(reg, &val)) {
+                ESP_LOGI("Si12T", "  reg[0x%02X] = 0x%02X", reg, val);
+            }
+        }
+
+        // 6. Read Output1 and record the boot baseline.  Any channels
+        //    that are "on" right after recalibration are considered stuck
+        //    (e.g. physical coupling to the housing) and will be masked.
         uint8_t out1 = 0;
         if (!SafeReadReg(REG_OUTPUT1, &out1)) {
             return false;
@@ -448,29 +489,48 @@ public:
             ESP_LOGW("Si12T", "Output1 read 0xFF (likely no device)");
             return false;
         }
-        ESP_LOGI("Si12T", "init OK: ctrl=0x%02X out1=0x%02X (sleep cleared)", ctrl, out1);
+        boot_baseline_ = out1;
+        ESP_LOGI("Si12T", "init OK: ctrl=0x%02X out1=0x%02X baseline=0x%02X (recalibrated)",
+                 ctrl, out1, boot_baseline_);
         return true;
     }
 
     // Sample channels CH1..CH3 from Output1 (0x10). Single-shot read; the
     // caller is expected to debounce / interpret duration externally.
+    // Channels that were stuck at boot are masked out automatically.
     TouchState ReadTouchState() {
         TouchState s = {};
         s.ok = false;
         if (!SafeReadReg(REG_OUTPUT1, &s.output1_raw)) {
             return s;
         }
+        // Output2/Output3 cover CH5-12.  The head electrodes were assumed to
+        // sit on CH1-3, but live captures show Output1 stays 0x00 under real
+        // touches, so read all three banks to locate the actual channels.
+        // Failures here are non-fatal: zone detection still runs on Output1.
+        SafeReadReg(REG_OUTPUT2, &s.output2_raw);
+        SafeReadReg(REG_OUTPUT3, &s.output3_raw);
         s.ok = true;
+        // Mask out channels that were "on" at boot (stuck / housing-coupled).
+        uint8_t effective = s.output1_raw & ~boot_baseline_;
         // Each channel uses 2 bits; nonzero = touched at some level.
-        s.zone[0] = ((s.output1_raw >> 0) & 0x3) != 0;  // CH1
-        s.zone[1] = ((s.output1_raw >> 2) & 0x3) != 0;  // CH2
-        s.zone[2] = ((s.output1_raw >> 4) & 0x3) != 0;  // CH3
+        s.zone[0] = ((effective >> 0) & 0x3) != 0;  // CH1
+        s.zone[1] = ((effective >> 2) & 0x3) != 0;  // CH2
+        s.zone[2] = ((effective >> 4) & 0x3) != 0;  // CH3
         return s;
     }
 
+    uint8_t boot_baseline() const { return boot_baseline_; }
+
 private:
+    static constexpr uint8_t REG_SENS_FIRST = 0x02;  // Sensitivity CH1+CH2
+    static constexpr uint8_t REG_SENS_LAST  = 0x07;  // ... through CH11+CH12
     static constexpr uint8_t REG_CTRL    = 0x09;  // CTRL, SLEEP bit etc.
+    static constexpr uint8_t REG_REF_RST = 0x0A;  // Reference reset (recalib)
     static constexpr uint8_t REG_OUTPUT1 = 0x10;  // CH1..CH4 packed (2bpp)
+    static constexpr uint8_t REG_OUTPUT2 = 0x11;  // CH5..CH8 packed (2bpp)
+    static constexpr uint8_t REG_OUTPUT3 = 0x12;  // CH9..CH12 packed (2bpp)
+    uint8_t boot_baseline_ = 0;                   // channels stuck at boot
 
     bool SafeReadReg(uint8_t reg, uint8_t* out) {
         esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, out, 1, 100);
@@ -498,67 +558,12 @@ private:
     Pmic* pmic_;
     Aw9523* aw9523_;
     Ft6336* ft6336_;
-    LcdDisplay* display_;
+    StackChanAvatarDisplay* display_;
     EspVideo* camera_;
     esp_timer_handle_t touchpad_timer_;
     PowerSaveTimer* power_save_timer_;
     ScsBus scs_bus_;
     std::unique_ptr<Py32IoExpander> io_expander_;
-
-    // Avatar overlay state. avatar_img_ is created lazily on the active LVGL
-    // screen because the screen tree (container_, emoji_label_, ...) is built
-    // by Application::Start() -> Display::SetupUI(), which runs after this
-    // board's constructor completes. avatar_init_timer_ retries every 500 ms
-    // until the screen is ready, then stops itself.
-    lv_obj_t* avatar_img_ = nullptr;
-    esp_timer_handle_t avatar_init_timer_ = nullptr;
-    std::string current_avatar_face_ = "idle";
-
-    // Phase 2: blinking + lip-sync overlay state.
-    // Blink works as a four-step state machine driven by blink_step_timer_:
-    //   FACE -> EYES_HALF -> EYES_CLOSED -> EYES_HALF -> FACE (restore last face)
-    // Each step is BLINK_STEP_MS apart. While a blink is in progress, further
-    // schedule events are dropped (we run to completion before re-arming).
-    // blink_schedule_timer_ fires every 3-6s (re-armed each cycle) and triggers
-    // a new blink only if blink_enabled_ and no other blink is in flight.
-    enum class BlinkState : uint8_t {
-        IDLE = 0,
-        EYES_HALF_DOWN,
-        EYES_CLOSED,
-        EYES_HALF_UP,
-    };
-    static constexpr int BLINK_STEP_MS = 100;
-    static constexpr int BLINK_MIN_GAP_MS = 3000;
-    static constexpr int BLINK_MAX_GAP_MS = 6000;
-    esp_timer_handle_t blink_schedule_timer_ = nullptr;
-    esp_timer_handle_t blink_step_timer_ = nullptr;
-    BlinkState blink_state_ = BlinkState::IDLE;
-    bool blink_enabled_ = false;
-    // Captures blink_enabled_ at the moment SetAvatarOff() runs, so that a
-    // later set_avatar(<other face>) can restore the previous blink state.
-    // Only meaningful while current_avatar_face_ == "off".
-    bool blink_enabled_before_off_ = false;
-
-    // Phase 4 audio (Issue #76): state-driven TTS lip-sync animation.
-    // Driven by the gateway's tts.start / tts.stop notifications (see
-    // Application::OnIncomingJson) via Board::OnTtsStart / OnTtsStop;
-    // cycles the mouth through closed -> half -> open -> half on a fixed
-    // TTS_LIPSYNC_STEP_MS cadence until stopped. Autonomous blink is paused
-    // while active (same Phase 2 trade-off as the mouth-sequence task: a
-    // blink ending would otherwise restore the full-face image and overwrite
-    // the mouth overlay). The user's most recent blink intent is read from
-    // blink_desired_ at stop so a set_blink call issued during playback is
-    // honoured.
-    enum class TtsLipSyncShape : uint8_t {
-        CLOSED = 0,
-        HALF_RISING,   // closed -> open transition
-        OPEN,
-        HALF_FALLING,  // open -> closed transition
-    };
-    static constexpr int TTS_LIPSYNC_STEP_MS = 150;
-    esp_timer_handle_t tts_lipsync_timer_ = nullptr;
-    std::atomic<bool> tts_lipsync_active_{false};
-    TtsLipSyncShape tts_lipsync_shape_ = TtsLipSyncShape::CLOSED;
 
     // Phase 7: Si12T head-touch sensing.
     // Polling every TOUCH_POLL_MS samples Output1 (CH1..CH3 -> 3 head zones).
@@ -583,17 +588,20 @@ private:
                                                   // inject brief "all-false"
                                                   // gaps that cut a real stroke
                                                   // short of 600 ms.
-    static constexpr int REACTION_HOLD_MS = 3000;
-    static constexpr int COOLDOWN_MS      = 800;  // post-reaction noise gate
+    static constexpr int REACTION_HOLD_MS = 2000;
+    static constexpr int COOLDOWN_MS      = 400;  // post-reaction noise gate
     // With 2-sample debounce this gives ~200 ms confirm latency, fast enough
     // to catch a quick "pon" (~200 ms press) while still rejecting single-
     // sample jitter. Was 200 ms polling -> 400 ms confirm, which silently
     // dropped most short taps.
-    static constexpr int SERVO_WOBBLE_STEP_MS = 350;  // was 200; SCS0009 needs
-                                                       // ~125 ms to physically
-                                                       // travel ±20°, plus the
-                                                       // ACK round-trip + IFG.
-                                                       // Tighter steps caused
+    static constexpr int SERVO_WOBBLE_STEP_MS = 550;  // Gentle nuzzle pace:
+                                                       // 6 steps x 550 ms ≈
+                                                       // 3.3 s total. Floor is
+                                                       // ~350 ms — SCS0009
+                                                       // needs ~125 ms to
+                                                       // travel ±20° plus ACK
+                                                       // round-trip + IFG;
+                                                       // tighter steps caused
                                                        // bus hangs.
     static constexpr int SERVO_WOBBLE_AMPLITUDE_DEG = 20;
 
@@ -642,6 +650,7 @@ private:
     SemaphoreHandle_t motion_mutex_ = nullptr;     // protects AxisMotion fields
     SemaphoreHandle_t scs_bus_mutex_ = nullptr;    // serializes UART access (WritePos/ReadPos)
     TaskHandle_t servo_task_handle_ = nullptr;
+    uint32_t servo_check_last_ms_ = 0;   // next idle health-check scheduling
     static constexpr uint32_t MOTION_TICK_MS = 20;
     static constexpr uint32_t MOTION_DEFAULT_DURATION_MS = 600;
     static constexpr uint32_t MOTION_PER_WRITE_TIME_MS = 30;
@@ -752,7 +761,10 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // Dim after 5 min idle; never auto power-off (-1).  The previous
+        // (60, 300) config hard-cut power via pmic_->PowerOff() after five
+        // silent minutes — a companion robot must stay alive while idle.
+        power_save_timer_ = new PowerSaveTimer(-1, 300, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(10);
@@ -819,29 +831,35 @@ private:
     void PollTouchpad() {
         static bool was_touched = false;
         static int64_t touch_start_time = 0;
-        const int64_t TOUCH_THRESHOLD_MS = 500;  // 触摸时长阈值，超过500ms视为长按
-        
+        const int64_t TAP_THRESHOLD_MS   = 400;  // short tap → toggle chat
+        const int64_t STROKE_THRESHOLD_MS = 400;  // hold ≥400ms → nuzzle!
+
         ft6336_->UpdateTouchPoint();
         auto& touch_point = ft6336_->GetTouchPoint();
-        
+
         // 检测触摸开始
         if (touch_point.num > 0 && !was_touched) {
             was_touched = true;
-            touch_start_time = esp_timer_get_time() / 1000; // 转换为毫秒
-        } 
+            touch_start_time = esp_timer_get_time() / 1000;
+        }
         // 检测触摸释放
         else if (touch_point.num == 0 && was_touched) {
             was_touched = false;
             int64_t touch_duration = (esp_timer_get_time() / 1000) - touch_start_time;
-            
-            // 只有短触才触发
-            if (touch_duration < TOUCH_THRESHOLD_MS) {
+
+            if (touch_duration < TAP_THRESHOLD_MS) {
+                // Short tap: original behaviour (wifi config / toggle chat)
                 auto& app = Application::GetInstance();
                 if (app.GetDeviceState() == kDeviceStateStarting) {
                     EnterWifiConfigMode();
                     return;
                 }
                 app.ToggleChatState();
+            } else if (touch_duration >= STROKE_THRESHOLD_MS) {
+                // Long press on screen → trigger nuzzle reaction (蹭蹭)!
+                // Same logic as the Si12T head-stroke handler.
+                ESP_LOGI(TAG, "Screen touch stroke (%lldms) → nuzzle!", (long long)touch_duration);
+                HandleStroke((uint64_t)touch_duration);
             }
         }
     }
@@ -909,7 +927,7 @@ private:
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        display_ = new StackChanAvatarDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
@@ -1442,17 +1460,22 @@ private:
 
     void ServoWobbleStepAdvance() {
         const int A = SERVO_WOBBLE_AMPLITUDE_DEG;
+        // Nuzzle motion: pitch-led lean-in with a faint yaw sway, then a slow
+        // settle — like nuzzling into a hand, not nodding.  Original code
+        // wobbled in yaw (left-right); changed to pitch for 丞丞.
         switch (servo_wobble_step_) {
-            case 0: WriteHeadAngles(-A, 0, SERVO_WOBBLE_STEP_MS); break;
-            case 1: WriteHeadAngles(+A, 0, SERVO_WOBBLE_STEP_MS); break;
-            case 2: WriteHeadAngles(-A, 0, SERVO_WOBBLE_STEP_MS); break;
-            case 3: WriteHeadAngles(  0, 0, SERVO_WOBBLE_STEP_MS); break;
+            case 0: WriteHeadAngles(-3, +A * 3 / 5, SERVO_WOBBLE_STEP_MS); break;  // lean in
+            case 1: WriteHeadAngles(+2, +A,         SERVO_WOBBLE_STEP_MS); break;  // nuzzle up
+            case 2: WriteHeadAngles(-2, +A + 5,     SERVO_WOBBLE_STEP_MS); break;  // deepest press
+            case 3: WriteHeadAngles(+3, +A * 4 / 5, SERVO_WOBBLE_STEP_MS); break;  // linger
+            case 4: WriteHeadAngles( 0, +A * 2 / 5, SERVO_WOBBLE_STEP_MS); break;  // ease down
+            case 5: WriteHeadAngles( 0, 0,          SERVO_WOBBLE_STEP_MS); break;  // settle
             default:
                 servo_wobble_active_ = false;
                 return;
         }
         servo_wobble_step_++;
-        if (servo_wobble_step_ <= 3) {
+        if (servo_wobble_step_ <= 5) {
             esp_timer_start_once(servo_wobble_timer_,
                                  (uint64_t)SERVO_WOBBLE_STEP_MS * 1000);
         } else {
@@ -1503,7 +1526,35 @@ private:
             pitch_local = pitch_motion_;
             xSemaphoreGive(motion_mutex_);
 
-            if (!yaw_local.moving && !pitch_local.moving) continue;
+            if (!yaw_local.moving && !pitch_local.moving) {
+                // Idle-time servo health check: voltage/load/temp/position from
+                // both servos answer "under-powered vs mechanically slipping"
+                // without a multimeter.  Runs every 10 s while the bus is quiet;
+                // a completed motion reschedules it to ~300 ms after the move
+                // so each line doubles as an arrival check (commanded vs actual).
+                uint32_t idle_now = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+                if (idle_now - servo_check_last_ms_ >= 10000) {
+                    servo_check_last_ms_ = idle_now;
+                    xSemaphoreTake(scs_bus_mutex_, portMAX_DELAY);
+                    int y_pos = scs_bus_.ReadPos(SERVO_YAW_ID);
+                    int y_v   = scs_bus_.ReadVoltage(SERVO_YAW_ID);
+                    int y_l   = scs_bus_.ReadLoad(SERVO_YAW_ID);
+                    int y_t   = scs_bus_.ReadTemper(SERVO_YAW_ID);
+                    vTaskDelay(kInterFrameGap);
+                    int p_pos = scs_bus_.ReadPos(SERVO_PITCH_ID);
+                    int p_v   = scs_bus_.ReadVoltage(SERVO_PITCH_ID);
+                    int p_l   = scs_bus_.ReadLoad(SERVO_PITCH_ID);
+                    int p_t   = scs_bus_.ReadTemper(SERVO_PITCH_ID);
+                    xSemaphoreGive(scs_bus_mutex_);
+                    ESP_LOGI(TAG, "Servo check: yaw(id%d) pos=%d volt=%d load=%d temp=%d"
+                                  " | pitch(id%d) pos=%d volt=%d load=%d temp=%d"
+                                  " (volt x0.1V; cmd yaw_deg=%d pitch_deg=%d)",
+                             SERVO_YAW_ID, y_pos, y_v, y_l, y_t,
+                             SERVO_PITCH_ID, p_pos, p_v, p_l, p_t,
+                             yaw_local.current_deg, pitch_local.current_deg);
+                }
+                continue;
+            }
 
             uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
 
@@ -1555,6 +1606,13 @@ private:
             }
             xSemaphoreGive(scs_bus_mutex_);
 
+            // A move that just completed schedules a health check ~300 ms out,
+            // turning the next check line into an arrival audit for that move.
+            if ((yaw_local.moving && !new_yaw_moving) ||
+                (pitch_local.moving && !new_pitch_moving)) {
+                servo_check_last_ms_ = now_ms - 9700;
+            }
+
             xSemaphoreTake(motion_mutex_, portMAX_DELAY);
             if (yaw_motion_.move_start_ms == yaw_local.move_start_ms) {
                 yaw_motion_.current_deg = new_yaw_current;
@@ -1580,7 +1638,9 @@ private:
     // does not re-cover the LCD after the user explicitly hid it.
     static void TouchRevertCb(void* arg) {
         StackChanBoard* self = static_cast<StackChanBoard*>(arg);
-        self->SetAvatarExpressionIfActive("idle");
+        if (self->display_ && !self->display_->IsAvatarOff()) {
+            self->display_->SetAvatarEmotion("neutral");
+        }
     }
 
     void ScheduleIdleRevert() {
@@ -1605,9 +1665,9 @@ private:
                  last_output1_raw_);
         last_event_ = TouchEvent::TAP;
         last_event_us_ = esp_timer_get_time();
-        // Use the IfActive variant so a tap during set_avatar("off") does
-        // not pop the avatar back over the WiFi config / settings screens.
-        SetAvatarExpressionIfActive("surprised");
+        if (display_ && !display_->IsAvatarOff()) {
+            display_->SetAvatarEmotion("surprised");
+        }
         ScheduleIdleRevert();
     }
 
@@ -1617,7 +1677,9 @@ private:
                  (unsigned long long)duration_ms, last_output1_raw_);
         last_event_ = TouchEvent::STROKE;
         last_event_us_ = esp_timer_get_time();
-        SetAvatarExpressionIfActive("embarrassed");
+        if (display_) {
+            display_->OnPetted();
+        }
         StartServoWobble();
         ScheduleIdleRevert();
     }
@@ -1636,6 +1698,30 @@ private:
         Si12T::TouchState s = si12t_->ReadTouchState();
         if (!s.ok) {
             return;
+        }
+        // Periodic raw-value diagnostic (every ~5 s = 50 polls at 100 ms).
+        // Any nonzero bank is logged immediately (10 Hz worst case) so touch
+        // events are visible live over serial; the quiet 5 s heartbeat keeps
+        // proving the poll loop is alive.  Battery/PMU state rides on the
+        // heartbeat to diagnose the on-USB discharge behaviour.
+        bool any_channel = s.output1_raw || s.output2_raw || s.output3_raw;
+        static int diag_counter = 0;
+        if (any_channel) {
+            ESP_LOGI(TAG, "Si12T TOUCH: out=[0x%02X 0x%02X 0x%02X] z=%d%d%d",
+                     s.output1_raw, s.output2_raw, s.output3_raw,
+                     s.zone[0], s.zone[1], s.zone[2]);
+        }
+        if (++diag_counter >= 50) {
+            diag_counter = 0;
+            ESP_LOGI(TAG, "Si12T poll: out=[0x%02X 0x%02X 0x%02X] z=%d%d%d",
+                     s.output1_raw, s.output2_raw, s.output3_raw,
+                     s.zone[0], s.zone[1], s.zone[2]);
+            if (pmic_) {
+                ESP_LOGI(TAG, "Power: soc=%d%% chg=%d dis=%d pmu=[0x%02X 0x%02X]",
+                         pmic_->GetBatteryLevel(), pmic_->IsCharging(),
+                         pmic_->IsDischarging(), pmic_->PmuStatus1(),
+                         pmic_->PmuStatus2());
+            }
         }
         // Snapshot for MCP visibility.
         last_output1_raw_ = s.output1_raw;
@@ -1709,6 +1795,10 @@ private:
             si12t_.reset();
             return;
         }
+        uint8_t bl = si12t_->boot_baseline();
+        if (bl) {
+            ESP_LOGW(TAG, "Si12T boot baseline=0x%02X — stuck channels will be masked", bl);
+        }
 
         esp_timer_create_args_t poll_args = {
             .callback = &StackChanBoard::TouchPollCb,
@@ -1723,806 +1813,12 @@ private:
         ESP_LOGI(TAG, "Si12T touch poll started (%d ms interval)", TOUCH_POLL_MS);
     }
 
-    // Map a face name (idle/happy/...) to the embedded RGB565 image.
-    // Returns nullptr if the name is unknown.
-    static const lv_image_dsc_t* AvatarImageFor(const char* face) {
-        if (face == nullptr) return nullptr;
-        if (strcmp(face, "idle") == 0)        return &avatar_idle;
-        if (strcmp(face, "happy") == 0)       return &avatar_happy;
-        if (strcmp(face, "thinking") == 0)    return &avatar_thinking;
-        if (strcmp(face, "sad") == 0)         return &avatar_sad;
-        if (strcmp(face, "surprised") == 0)   return &avatar_surprised;
-        if (strcmp(face, "embarrassed") == 0) return &avatar_embarrassed;
-        return nullptr;
-    }
 
-    // Create avatar_img_ on the active LVGL screen, scaled to fill the LCD.
-    // Caller must hold the LVGL/display lock. Returns true on success or
-    // when avatar_img_ already exists.
-    bool EnsureAvatarObject() {
-        if (avatar_img_ != nullptr) {
-            return true;
-        }
-        lv_obj_t* screen = lv_screen_active();
-        if (screen == nullptr) {
-            return false;
-        }
-        avatar_img_ = lv_image_create(screen);
-        if (avatar_img_ == nullptr) {
-            return false;
-        }
-        // Center on the 320x240 LCD and upscale 160x120 -> ~320x240 (2x).
-        // lv_image_set_scale uses 256 = 1.0x; 512 = 2.0x.
-        lv_image_set_scale(avatar_img_, 512);
-        lv_obj_align(avatar_img_, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_SCROLLABLE);
-        // Keep the avatar visually on top of the chat UI's emoji_label_,
-        // chat bubbles, etc. The status bar (clock/battery) lives on a
-        // separate sibling and is moved to foreground later if needed.
-        lv_obj_move_foreground(avatar_img_);
-        ESP_LOGI(TAG, "Avatar lv_image created on active screen");
-        return true;
-    }
 
-    // Apply the requested face to avatar_img_. Returns false if the face is
-    // unknown or the avatar object cannot be created yet.
-    bool SetAvatarExpressionLocked(const char* face) {
-        const lv_image_dsc_t* dsc = AvatarImageFor(face);
-        if (dsc == nullptr) {
-            return false;
-        }
-        if (!EnsureAvatarObject()) {
-            return false;
-        }
-        lv_image_set_src(avatar_img_, dsc);
-        lv_obj_move_foreground(avatar_img_);
-        current_avatar_face_ = face;
-        return true;
-    }
 
-    // Public-style entry that takes the display lock. Used by the MCP tool
-    // and by the deferred init timer. Always safe to call from any task.
-    //
-    // Also handles the "resume from off" path: if the previous face was
-    // "off" (avatar layer hidden), the layer is unhidden here, and if blink
-    // was enabled before SetAvatarOff() ran it is restored automatically.
-    bool SetAvatarExpression(const char* face) {
-        if (display_ == nullptr) {
-            ESP_LOGW(TAG, "SetAvatarExpression('%s') ignored: display_ not ready", face);
-            return false;
-        }
-        bool was_off = (current_avatar_face_ == "off");
-        bool ok;
-        {
-            DisplayLockGuard lock(display_);
-            if (avatar_img_ != nullptr) {
-                // Restore visibility if a previous SetAvatarOff() hid the
-                // layer. Cheap no-op when the flag is already clear.
-                lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
-            }
-            ok = SetAvatarExpressionLocked(face);
-        }
-        if (!ok) {
-            ESP_LOGW(TAG, "SetAvatarExpression('%s') deferred (face unknown or screen not ready)", face);
-            return ok;
-        }
-        // Coming back from "off": if blink was on before going off, restart
-        // it so the user does not have to re-issue set_blink. The default
-        // experience is "blink follows the avatar".
-        if (was_off && blink_enabled_before_off_) {
-            StartBlinkTimer();
-            ESP_LOGI(TAG, "Blink restored after avatar resume from OFF");
-        }
-        blink_enabled_before_off_ = false;
-        return ok;
-    }
 
-    // Hide the avatar layer and disable blink so the underlying
-    // xiaozhi-esp32 screens (WiFi config UI, OTA, settings) become visible.
-    // The avatar lv_obj is kept allocated so a subsequent
-    // SetAvatarExpression(<other face>) can re-show it cheaply, and the
-    // previous blink state is remembered for restoration.
-    bool SetAvatarOff() {
-        if (display_ == nullptr) {
-            ESP_LOGW(TAG, "SetAvatarOff() ignored: display_ not ready");
-            return false;
-        }
-        // Capture the previous blink state only on the first transition
-        // into "off". A repeated set_avatar("off") while already off must
-        // not overwrite the saved state with the post-off (always-false)
-        // blink_enabled_.
-        if (current_avatar_face_ != "off") {
-            blink_enabled_before_off_ = blink_enabled_;
-        }
-        // StopBlinkTimer() takes the display lock internally for the
-        // resting-face restore step, so call it before grabbing our lock.
-        StopBlinkTimer();
-        {
-            DisplayLockGuard lock(display_);
-            if (avatar_img_ != nullptr) {
-                lv_obj_add_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-        current_avatar_face_ = "off";
-        ESP_LOGI(TAG, "Avatar OFF: hidden + blink disabled (was %s)",
-                 blink_enabled_before_off_ ? "ON" : "OFF");
-        return true;
-    }
 
-    // Internal-only entry used by autonomous animations (touch reactions,
-    // idle revert, etc.). Skips the face change while the avatar is in
-    // the user-requested "off" state, so the underlying xiaozhi-esp32
-    // screens remain visible. Returns true if the face was applied.
-    bool SetAvatarExpressionIfActive(const char* face) {
-        if (current_avatar_face_ == "off") {
-            ESP_LOGD(TAG, "SetAvatarExpressionIfActive('%s') skipped: avatar is OFF", face);
-            return false;
-        }
-        return SetAvatarExpression(face);
-    }
 
-    // Schedule a one-shot/periodic timer that keeps trying to install the
-    // initial avatar image until the LVGL screen tree is ready (i.e. after
-    // Application::Start() has run Display::SetupUI()).
-    void InitializeAvatar() {
-        ESP_LOGI(TAG, "Schedule avatar init (deferred until SetupUI completes)");
-        esp_timer_create_args_t timer_args = {
-            .callback = [](void* arg) {
-                StackChanBoard* board = static_cast<StackChanBoard*>(arg);
-                if (board->SetAvatarExpression("idle")) {
-                    ESP_LOGI(TAG, "Initial avatar (idle) installed");
-                    if (board->avatar_init_timer_ != nullptr) {
-                        esp_timer_stop(board->avatar_init_timer_);
-                    }
-                }
-            },
-            .arg = this,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "avatar_init",
-            .skip_unhandled_events = true,
-        };
-        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &avatar_init_timer_));
-        // Retry every 500 ms; SetupUI() typically completes within a few
-        // hundred ms after Application::Start(). Once installed the callback
-        // stops the timer.
-        ESP_ERROR_CHECK(esp_timer_start_periodic(avatar_init_timer_, 500 * 1000));
-    }
-
-    // ---- Phase 2: parts (eyes / mouth) and blink state machine ----------
-    //
-    // Eye state images (avatar_eyes_open / _half / _closed) are referenced
-    // directly by the blink state machine; we don't expose a generic
-    // EyesImageFor() helper yet because no MCP tool sets eyes manually.
-    // Phase 3 may add `self.display.set_eyes` if needed.
-
-    // Map a mouth shape name to its full-frame image. Returns nullptr if unknown.
-    static const lv_image_dsc_t* MouthImageFor(const char* shape) {
-        if (shape == nullptr) return nullptr;
-        if (strcmp(shape, "closed") == 0) return &avatar_mouth_closed;
-        if (strcmp(shape, "half") == 0)   return &avatar_mouth_half;
-        if (strcmp(shape, "open") == 0)   return &avatar_mouth_open;
-        if (strcmp(shape, "e") == 0)      return &avatar_mouth_e;
-        if (strcmp(shape, "u") == 0)      return &avatar_mouth_u;
-        return nullptr;
-    }
-
-    // Swap avatar_img_ to a part image (eye or mouth). Caller must hold lock.
-    // Does NOT touch current_avatar_face_, so SetAvatarExpression(...) called
-    // later will still know what face to "return to".
-    bool SetPartImageLocked(const lv_image_dsc_t* dsc) {
-        if (dsc == nullptr) return false;
-        if (!EnsureAvatarObject()) return false;
-        lv_image_set_src(avatar_img_, dsc);
-        lv_obj_move_foreground(avatar_img_);
-        return true;
-    }
-
-    // Restore the last full-face expression after a part overlay.
-    bool RestoreCurrentFaceLocked() {
-        const lv_image_dsc_t* dsc = AvatarImageFor(current_avatar_face_.c_str());
-        if (dsc == nullptr) {
-            // Fall back to idle if somehow stale.
-            dsc = &avatar_idle;
-        }
-        if (!EnsureAvatarObject()) return false;
-        lv_image_set_src(avatar_img_, dsc);
-        lv_obj_move_foreground(avatar_img_);
-        return true;
-    }
-
-    // Public mouth setter: wraps lock + look-up.
-    bool SetMouthShape(const char* shape) {
-        if (display_ == nullptr) {
-            ESP_LOGW(TAG, "SetMouthShape('%s') ignored: display_ not ready", shape);
-            return false;
-        }
-        const lv_image_dsc_t* dsc = MouthImageFor(shape);
-        if (dsc == nullptr) {
-            return false;
-        }
-        DisplayLockGuard lock(display_);
-        return SetPartImageLocked(dsc);
-    }
-
-    // Step callback for the four-phase blink sequence. Each invocation
-    // advances blink_state_, applies the corresponding image, and re-arms
-    // blink_step_timer_ unless we're returning to the resting face.
-    static void BlinkStepCb(void* arg) {
-        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
-        self->BlinkStepAdvance();
-    }
-
-    void BlinkStepAdvance() {
-        if (display_ == nullptr) {
-            blink_state_ = BlinkState::IDLE;
-            return;
-        }
-        DisplayLockGuard lock(display_);
-        switch (blink_state_) {
-            case BlinkState::EYES_HALF_DOWN:
-                SetPartImageLocked(&avatar_eyes_closed);
-                blink_state_ = BlinkState::EYES_CLOSED;
-                esp_timer_start_once(blink_step_timer_, BLINK_STEP_MS * 1000);
-                break;
-            case BlinkState::EYES_CLOSED:
-                SetPartImageLocked(&avatar_eyes_half);
-                blink_state_ = BlinkState::EYES_HALF_UP;
-                esp_timer_start_once(blink_step_timer_, BLINK_STEP_MS * 1000);
-                break;
-            case BlinkState::EYES_HALF_UP:
-                // Final: restore the last applied face (Phase 2 trade-off:
-                // any active mouth overlay is replaced by the face image).
-                RestoreCurrentFaceLocked();
-                blink_state_ = BlinkState::IDLE;
-                break;
-            case BlinkState::IDLE:
-            default:
-                // Stale callback; nothing to do.
-                break;
-        }
-    }
-
-    // Schedule callback: fires roughly every BLINK_MIN_GAP_MS..BLINK_MAX_GAP_MS.
-    // Starts a new blink if enabled and not already blinking, then re-arms
-    // itself with a fresh random interval.
-    static void BlinkScheduleCb(void* arg) {
-        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
-        self->BlinkScheduleTick();
-    }
-
-    void BlinkScheduleTick() {
-        if (blink_enabled_ && blink_state_ == BlinkState::IDLE && display_ != nullptr) {
-            // Begin the blink: half-down now, full-closed at next step.
-            DisplayLockGuard lock(display_);
-            if (SetPartImageLocked(&avatar_eyes_half)) {
-                blink_state_ = BlinkState::EYES_HALF_DOWN;
-                esp_timer_start_once(blink_step_timer_, BLINK_STEP_MS * 1000);
-            }
-        }
-        // Re-arm scheduler with a fresh random interval, even if we skipped
-        // this blink (e.g. avatar not yet on screen). This keeps the cadence
-        // organic instead of clumping after a long pause.
-        if (blink_enabled_) {
-            uint32_t span_ms = BLINK_MAX_GAP_MS - BLINK_MIN_GAP_MS;
-            uint32_t next_ms = BLINK_MIN_GAP_MS + (esp_random() % span_ms);
-            esp_timer_start_once(blink_schedule_timer_, (uint64_t)next_ms * 1000);
-        }
-    }
-
-    void EnsureBlinkTimers() {
-        if (blink_step_timer_ == nullptr) {
-            esp_timer_create_args_t step_args = {
-                .callback = &StackChanBoard::BlinkStepCb,
-                .arg = this,
-                .dispatch_method = ESP_TIMER_TASK,
-                .name = "blink_step",
-                .skip_unhandled_events = true,
-            };
-            ESP_ERROR_CHECK(esp_timer_create(&step_args, &blink_step_timer_));
-        }
-        if (blink_schedule_timer_ == nullptr) {
-            esp_timer_create_args_t sched_args = {
-                .callback = &StackChanBoard::BlinkScheduleCb,
-                .arg = this,
-                .dispatch_method = ESP_TIMER_TASK,
-                .name = "blink_sched",
-                .skip_unhandled_events = true,
-            };
-            ESP_ERROR_CHECK(esp_timer_create(&sched_args, &blink_schedule_timer_));
-        }
-    }
-
-    void StartBlinkTimer() {
-        EnsureBlinkTimers();
-        blink_enabled_ = true;
-        // Make sure no leftover schedule timer is running, then arm one with
-        // a fresh random interval.
-        esp_timer_stop(blink_schedule_timer_);
-        uint32_t span_ms = BLINK_MAX_GAP_MS - BLINK_MIN_GAP_MS;
-        uint32_t first_ms = BLINK_MIN_GAP_MS + (esp_random() % span_ms);
-        esp_timer_start_once(blink_schedule_timer_, (uint64_t)first_ms * 1000);
-        ESP_LOGI(TAG, "Blink ENABLED (first blink in %u ms)", (unsigned)first_ms);
-    }
-
-    void StopBlinkTimer() {
-        blink_enabled_ = false;
-        if (blink_schedule_timer_ != nullptr) {
-            esp_timer_stop(blink_schedule_timer_);
-        }
-        if (blink_step_timer_ != nullptr) {
-            esp_timer_stop(blink_step_timer_);
-        }
-        // If we stopped mid-sequence, snap back to the resting face so the
-        // user is not left staring at half-closed eyes.
-        if (blink_state_ != BlinkState::IDLE && display_ != nullptr) {
-            DisplayLockGuard lock(display_);
-            RestoreCurrentFaceLocked();
-        }
-        blink_state_ = BlinkState::IDLE;
-        ESP_LOGI(TAG, "Blink DISABLED");
-    }
-
-    // ---- Phase 4 audio (Issue #76): TTS state-driven lip-sync ----------
-    //
-    // While the gateway is playing TTS audio (tts.start..tts.stop), cycle
-    // the mouth shape through CLOSED -> HALF -> OPEN -> HALF on a fixed
-    // TTS_LIPSYNC_STEP_MS cadence. This is the (A) state-driven approach
-    // proposed in Issue #76; the (B) audio-envelope-driven follow-up will
-    // replace this cycle with a per-frame amplitude mapping in a separate
-    // change.
-    //
-    // Concurrency:
-    //   - Single esp_timer self-rearming on ESP_TIMER_TASK.
-    //   - Coexists with the mouth-sequence playback task: when
-    //     mouth_seq_active_ is true (the user issued a set_mouth_sequence
-    //     while we were animating), the lip-sync step yields its frame and
-    //     re-arms; the user-issued sequence wins until it completes, then
-    //     lip-sync resumes naturally on the next tick.
-    //   - Pauses autonomous blink while active (same Phase 2 reasoning as
-    //     the mouth-sequence task: BlinkStepAdvance()'s
-    //     RestoreCurrentFaceLocked() would overwrite the mouth overlay).
-    //     Restores blink at stop based on blink_desired_ so a set_blink
-    //     issued mid-playback is honoured.
-    static void TtsLipSyncStepCb(void* arg) {
-        static_cast<StackChanBoard*>(arg)->TtsLipSyncStepAdvance();
-    }
-
-    void TtsLipSyncStepAdvance() {
-        if (!tts_lipsync_active_.load(std::memory_order_acquire)) {
-            return;
-        }
-        if (display_ == nullptr) {
-            return;
-        }
-        // Yield to an in-flight user-issued mouth sequence; re-arm so we
-        // resume on our cadence as soon as the sequence finishes.
-        if (mouth_seq_active_.load(std::memory_order_acquire)) {
-            esp_timer_start_once(tts_lipsync_timer_,
-                                 (uint64_t)TTS_LIPSYNC_STEP_MS * 1000);
-            return;
-        }
-        const char* shape = nullptr;
-        switch (tts_lipsync_shape_) {
-            case TtsLipSyncShape::CLOSED:
-                shape = "half";
-                tts_lipsync_shape_ = TtsLipSyncShape::HALF_RISING;
-                break;
-            case TtsLipSyncShape::HALF_RISING:
-                shape = "open";
-                tts_lipsync_shape_ = TtsLipSyncShape::OPEN;
-                break;
-            case TtsLipSyncShape::OPEN:
-                shape = "half";
-                tts_lipsync_shape_ = TtsLipSyncShape::HALF_FALLING;
-                break;
-            case TtsLipSyncShape::HALF_FALLING:
-            default:
-                shape = "closed";
-                tts_lipsync_shape_ = TtsLipSyncShape::CLOSED;
-                break;
-        }
-        SetMouthShape(shape);
-        if (tts_lipsync_active_.load(std::memory_order_acquire)) {
-            esp_timer_start_once(tts_lipsync_timer_,
-                                 (uint64_t)TTS_LIPSYNC_STEP_MS * 1000);
-        }
-    }
-
-    void EnsureTtsLipSyncTimer() {
-        if (tts_lipsync_timer_ == nullptr) {
-            esp_timer_create_args_t args = {
-                .callback = &StackChanBoard::TtsLipSyncStepCb,
-                .arg = this,
-                .dispatch_method = ESP_TIMER_TASK,
-                .name = "tts_lipsync",
-                .skip_unhandled_events = true,
-            };
-            ESP_ERROR_CHECK(esp_timer_create(&args, &tts_lipsync_timer_));
-        }
-    }
-
-    void StartTtsLipSync() {
-        if (display_ == nullptr) {
-            ESP_LOGD(TAG, "StartTtsLipSync ignored: display_ not ready");
-            return;
-        }
-        EnsureTtsLipSyncTimer();
-        if (tts_lipsync_active_.exchange(true, std::memory_order_acq_rel)) {
-            // Already active (e.g. duplicate tts.start); nothing to do.
-            return;
-        }
-        // Pause autonomous blink so BlinkStepAdvance()'s
-        // RestoreCurrentFaceLocked() does not overwrite the mouth overlay.
-        // blink_desired_ remembers the user's intent for restore at stop.
-        StopBlinkTimer();
-        // Start the cycle from a known resting position so the first audible
-        // frame opens the mouth from closed.
-        tts_lipsync_shape_ = TtsLipSyncShape::CLOSED;
-        SetMouthShape("closed");
-        esp_timer_start_once(tts_lipsync_timer_,
-                             (uint64_t)TTS_LIPSYNC_STEP_MS * 1000);
-        ESP_LOGI(TAG, "TTS lip-sync STARTED (cycle=%d ms)",
-                 TTS_LIPSYNC_STEP_MS);
-    }
-
-    void StopTtsLipSync() {
-        if (!tts_lipsync_active_.exchange(false, std::memory_order_acq_rel)) {
-            return;  // already stopped
-        }
-        if (tts_lipsync_timer_ != nullptr) {
-            esp_timer_stop(tts_lipsync_timer_);
-        }
-        // If a user-issued mouth sequence is in flight (we were yielding
-        // our frames to it via the mouth_seq_active_ guard in
-        // TtsLipSyncStepAdvance), let the sequence task own both the
-        // mouth shape and the blink restore at sequence end. Touching
-        // either here would race the sequence:
-        //   - SetMouthShape("closed") would clobber the user's current
-        //     frame mid-sequence;
-        //   - StartBlinkTimer() would let BlinkStepAdvance()'s
-        //     RestoreCurrentFaceLocked() overwrite the mouth overlay
-        //     before the sequence finishes drawing (Phase 2 trade-off).
-        // The sequence task already restores blink from blink_desired_
-        // at its own end (see MouthSequenceTaskLoop), so deferring is
-        // safe and idempotent.
-        if (mouth_seq_active_.load(std::memory_order_acquire)) {
-            ESP_LOGI(TAG,
-                     "TTS lip-sync STOPPED (mouth_seq active; deferring "
-                     "mouth + blink restore to sequence end)");
-            return;
-        }
-        // Snap back to a closed mouth so the device does not freeze on a
-        // half-open frame.
-        if (display_ != nullptr) {
-            SetMouthShape("closed");
-        }
-        // Restore blink based on the user's most recent intent (mirrors the
-        // mouth-sequence playback task's restore semantics).
-        if (blink_desired_.load(std::memory_order_acquire)) {
-            StartBlinkTimer();
-        }
-        ESP_LOGI(TAG, "TTS lip-sync STOPPED");
-    }
-
-    // ---- Phase 2: lip-sync sequence playback (Issue #5) ----------------
-    //
-    // set_mouth_sequence accepts a list of {shape, duration_ms} pairs and
-    // walks through it on a dedicated FreeRTOS task. Each step swaps the
-    // mouth-only image and waits duration_ms before advancing. Walking the
-    // queue locally avoids the per-step WebSocket RTT jitter that callers
-    // see when issuing many set_mouth calls back-to-back from a TTS loop.
-    //
-    // Concurrency model:
-    //   - mouth_seq_lock_ protects mouth_seq_pending_.
-    //   - mouth_seq_signal_ is a binary semaphore that wakes the task when
-    //     a new sequence has been enqueued.
-    //   - mouth_seq_active_ / mouth_seq_cancel_requested_ are volatile flags
-    //     read by the task between steps. Setting cancel_requested while the
-    //     task is sleeping in vTaskDelay simply means the task picks up the
-    //     cancel at the next slice boundary (kMouthCancelSliceMs apart).
-    //   - Re-entry semantics: a fresh set_mouth_sequence call replaces the
-    //     pending queue and marks cancel_requested so the task drops the
-    //     remainder of the current sequence and starts the new one.
-    //   - Interrupt sources: set_mouth, set_avatar, and set_mouth_sequence
-    //     all call RequestMouthSequenceCancel() before mutating display
-    //     state, so a sequence in flight is cleanly preempted.
-    //
-    // Trade-offs:
-    //   - The MCP Property type system does not support array values, so
-    //     the gateway serialises `steps` to a JSON string and passes it as
-    //     `steps_json`. Validation happens here once, atomically: if any
-    //     step is malformed the whole call is rejected and nothing is
-    //     queued (no half-played sequences).
-    //   - Autonomous blink is paused while a sequence plays because the
-    //     blink state machine ends by calling RestoreCurrentFaceLocked(),
-    //     which would replace the active mouth overlay with the resting
-    //     face image (see Phase 2 comment near BlinkStepAdvance()).
-    //   - The final shape is held after the sequence finishes; callers
-    //     that want the mouth to close at the end should append a
-    //     {"closed", N} step explicitly. This keeps the primitive composable
-    //     with future expression-style use cases (e.g. ending on an open
-    //     smile).
-    static constexpr int kMaxMouthSequenceSteps = 256;
-    static constexpr int kMouthStepMinMs = 10;
-    static constexpr int kMouthStepMaxMs = 10000;
-    static constexpr uint32_t kMouthCancelSliceMs = 20;
-
-    struct MouthStep {
-        std::string shape;
-        uint32_t duration_ms;
-    };
-
-    struct MouthSequenceEnqueueResult {
-        bool ok;
-        std::string error;
-        int queued_steps;
-        uint32_t total_duration_ms;
-    };
-
-    TaskHandle_t mouth_seq_task_ = nullptr;
-    SemaphoreHandle_t mouth_seq_lock_ = nullptr;     // protects mouth_seq_pending_ + generation
-    SemaphoreHandle_t mouth_seq_signal_ = nullptr;   // binary semaphore: wake the task
-    std::vector<MouthStep> mouth_seq_pending_;
-    std::atomic<bool> mouth_seq_active_{false};
-    std::atomic<bool> mouth_seq_cancel_requested_{false};
-    // Generation counter bumped under mouth_seq_lock_ by every preemption
-    // path (set_mouth, set_avatar, fresh set_mouth_sequence). The playback
-    // task latches a snapshot at sequence start and re-checks before every
-    // SetMouthShape() call, so a preempt issued in the 0..kMouthCancelSliceMs
-    // window between the last cancel-flag check and the next SetMouthShape
-    // call still aborts the current frame draw. Without this, the task
-    // could draw one stale mouth frame after the user-issued set_mouth /
-    // set_avatar handler had already returned.
-    std::atomic<uint32_t> mouth_seq_generation_{0};
-    // User's explicitly-requested blink state, independent of whether
-    // a mouth sequence is currently suppressing the timer. set_blink
-    // updates this; the playback task restores StartBlinkTimer() at
-    // sequence end iff this is true. Without this split a set_blink
-    // call issued during a sequence is silently overwritten by the
-    // pre-sequence snapshot when the task finishes.
-    std::atomic<bool> blink_desired_{false};
-
-    // Mark any in-flight or pending sequence for cancellation. Safe to
-    // call from any thread. Takes mouth_seq_lock_ so that:
-    //   - mouth_seq_pending_ is cleared atomically (callers that issue
-    //     set_mouth / set_avatar in the brief window between
-    //     EnqueueMouthSequence() returning and the task waking up don't
-    //     get overwritten by the queued-but-not-yet-active sequence);
-    //   - mouth_seq_cancel_requested_ is set so the task aborts at the
-    //     next slice boundary if it is already active;
-    //   - mouth_seq_generation_ is bumped under release ordering so the
-    //     task observes a stale generation at its next per-step check
-    //     and skips the remaining SetMouthShape() calls.
-    // Idempotent under repeated calls.
-    void RequestMouthSequenceCancel() {
-        if (mouth_seq_lock_ == nullptr) {
-            return;
-        }
-        if (xSemaphoreTake(mouth_seq_lock_, portMAX_DELAY) == pdTRUE) {
-            mouth_seq_pending_.clear();
-            mouth_seq_cancel_requested_.store(true, std::memory_order_release);
-            mouth_seq_generation_.fetch_add(1, std::memory_order_release);
-            xSemaphoreGive(mouth_seq_lock_);
-        }
-    }
-
-    // Parse and validate a JSON-serialised sequence, then atomically
-    // replace mouth_seq_pending_ and signal the playback task. Returns
-    // a populated MouthSequenceEnqueueResult; on validation failure
-    // nothing is queued.
-    MouthSequenceEnqueueResult EnqueueMouthSequence(const std::string& steps_json) {
-        MouthSequenceEnqueueResult r{false, std::string(), 0, 0};
-
-        cJSON* root = cJSON_Parse(steps_json.c_str());
-        if (root == nullptr) {
-            r.error = "steps must be a JSON array (parse failed)";
-            return r;
-        }
-        if (!cJSON_IsArray(root)) {
-            r.error = "steps must be a JSON array";
-            cJSON_Delete(root);
-            return r;
-        }
-        int n = cJSON_GetArraySize(root);
-        if (n < 1 || n > kMaxMouthSequenceSteps) {
-            r.error = std::string("steps length out of range (1..") +
-                      std::to_string(kMaxMouthSequenceSteps) + ")";
-            cJSON_Delete(root);
-            return r;
-        }
-
-        std::vector<MouthStep> parsed;
-        parsed.reserve(static_cast<size_t>(n));
-        uint32_t total = 0;
-        for (int i = 0; i < n; ++i) {
-            cJSON* item = cJSON_GetArrayItem(root, i);
-            if (!cJSON_IsObject(item)) {
-                r.error = std::string("step[") + std::to_string(i) + "] must be an object";
-                cJSON_Delete(root);
-                return r;
-            }
-            cJSON* shape = cJSON_GetObjectItem(item, "shape");
-            cJSON* dur = cJSON_GetObjectItem(item, "duration_ms");
-            if (!cJSON_IsString(shape) || shape->valuestring == nullptr) {
-                r.error = std::string("step[") + std::to_string(i) + "].shape must be a string";
-                cJSON_Delete(root);
-                return r;
-            }
-            if (!cJSON_IsNumber(dur)) {
-                r.error = std::string("step[") + std::to_string(i) + "].duration_ms must be an integer";
-                cJSON_Delete(root);
-                return r;
-            }
-            if (MouthImageFor(shape->valuestring) == nullptr) {
-                r.error = std::string("step[") + std::to_string(i) +
-                          "].shape unknown: '" + shape->valuestring +
-                          "' (allowed: closed, half, open, e, u)";
-                cJSON_Delete(root);
-                return r;
-            }
-            int d = dur->valueint;
-            if (d < kMouthStepMinMs || d > kMouthStepMaxMs) {
-                r.error = std::string("step[") + std::to_string(i) +
-                          "].duration_ms out of range (" +
-                          std::to_string(kMouthStepMinMs) + ".." +
-                          std::to_string(kMouthStepMaxMs) + ")";
-                cJSON_Delete(root);
-                return r;
-            }
-            parsed.push_back({std::string(shape->valuestring),
-                              static_cast<uint32_t>(d)});
-            total += static_cast<uint32_t>(d);
-        }
-        cJSON_Delete(root);
-
-        if (mouth_seq_lock_ == nullptr || mouth_seq_signal_ == nullptr ||
-            mouth_seq_task_ == nullptr) {
-            r.error = "mouth sequence task not initialised";
-            return r;
-        }
-
-        // Atomically replace the pending queue and mark any in-flight
-        // sequence for cancellation so it stops at the next slice. The
-        // generation bump is what makes a fresh enqueue preempt the
-        // currently-playing sequence even between cancel-flag checks
-        // and SetMouthShape() calls (per-step generation re-check in
-        // MouthSequenceTaskLoop).
-        if (xSemaphoreTake(mouth_seq_lock_, portMAX_DELAY) == pdTRUE) {
-            mouth_seq_pending_ = std::move(parsed);
-            if (mouth_seq_active_.load(std::memory_order_acquire)) {
-                mouth_seq_cancel_requested_.store(true, std::memory_order_release);
-            }
-            mouth_seq_generation_.fetch_add(1, std::memory_order_release);
-            xSemaphoreGive(mouth_seq_lock_);
-        }
-        // Wake the task. If the task is already running through a previous
-        // sequence, it will pick up the new pending queue after observing
-        // cancel_requested at the next slice and looping back.
-        xSemaphoreGive(mouth_seq_signal_);
-
-        r.ok = true;
-        r.queued_steps = n;
-        r.total_duration_ms = total;
-        return r;
-    }
-
-    static void MouthSequenceTaskTrampoline(void* arg) {
-        static_cast<StackChanBoard*>(arg)->MouthSequenceTaskLoop();
-    }
-
-    void MouthSequenceTaskLoop() {
-        for (;;) {
-            // Wait until something is enqueued (or self-signaled at the
-            // tail of a previous run when more pending was discovered).
-            xSemaphoreTake(mouth_seq_signal_, portMAX_DELAY);
-
-            // Drain whatever is pending right now into a local copy so
-            // we can release the lock before walking the sequence. Latch
-            // the generation under the same lock so we can reject any
-            // newer preempt at the next per-step check.
-            std::vector<MouthStep> seq;
-            uint32_t my_generation = 0;
-            if (xSemaphoreTake(mouth_seq_lock_, portMAX_DELAY) == pdTRUE) {
-                seq = std::move(mouth_seq_pending_);
-                mouth_seq_pending_.clear();
-                mouth_seq_cancel_requested_.store(false, std::memory_order_release);
-                mouth_seq_active_.store(!seq.empty(), std::memory_order_release);
-                my_generation = mouth_seq_generation_.load(std::memory_order_acquire);
-                xSemaphoreGive(mouth_seq_lock_);
-            }
-            if (seq.empty()) {
-                continue;
-            }
-
-            // Pause autonomous blink for the duration of the sequence so
-            // BlinkStepAdvance()'s RestoreCurrentFaceLocked() does not
-            // overwrite the active mouth overlay. Note: we no longer
-            // snapshot blink_enabled_ here — the user's intent is read
-            // from blink_desired_ at sequence end so calls to set_blink
-            // made during playback are honoured.
-            StopBlinkTimer();
-
-            for (const auto& step : seq) {
-                // Re-check cancel + generation right before each frame
-                // draw. Any preempt issued between this check and the
-                // previous SetMouthShape() will be observed here, so we
-                // never draw a frame after a newer set_mouth / set_avatar
-                // / set_mouth_sequence handler has returned to the caller.
-                if (mouth_seq_cancel_requested_.load(std::memory_order_acquire) ||
-                    mouth_seq_generation_.load(std::memory_order_acquire) != my_generation) {
-                    break;
-                }
-                SetMouthShape(step.shape.c_str());
-                // Sleep in small slices so cancel is observed quickly.
-                uint32_t remaining = step.duration_ms;
-                while (remaining > 0 &&
-                       !mouth_seq_cancel_requested_.load(std::memory_order_acquire) &&
-                       mouth_seq_generation_.load(std::memory_order_acquire) == my_generation) {
-                    uint32_t slice = remaining > kMouthCancelSliceMs
-                                         ? kMouthCancelSliceMs
-                                         : remaining;
-                    vTaskDelay(pdMS_TO_TICKS(slice));
-                    remaining -= slice;
-                }
-            }
-
-            // Restore blink according to the user's most recent intent,
-            // not a snapshot taken before the sequence started. This way
-            // a set_blink(true/false) issued during the sequence is the
-            // one that wins at the end.
-            if (blink_desired_.load(std::memory_order_acquire)) {
-                StartBlinkTimer();
-            }
-
-            // If a fresh sequence was enqueued during playback, the
-            // cancel path above will have left it in mouth_seq_pending_.
-            // Self-signal so the next outer-loop iteration picks it up
-            // immediately rather than parking on the semaphore.
-            bool has_more = false;
-            if (xSemaphoreTake(mouth_seq_lock_, portMAX_DELAY) == pdTRUE) {
-                mouth_seq_active_.store(false, std::memory_order_release);
-                has_more = !mouth_seq_pending_.empty();
-                xSemaphoreGive(mouth_seq_lock_);
-            }
-            if (has_more) {
-                xSemaphoreGive(mouth_seq_signal_);
-            }
-        }
-    }
-
-    void InitializeMouthSequenceTask() {
-        if (mouth_seq_task_ != nullptr) {
-            return;
-        }
-        mouth_seq_lock_ = xSemaphoreCreateMutex();
-        mouth_seq_signal_ = xSemaphoreCreateBinary();
-        if (mouth_seq_lock_ == nullptr || mouth_seq_signal_ == nullptr) {
-            ESP_LOGE(TAG, "Failed to create mouth sequence sync primitives");
-            if (mouth_seq_lock_ != nullptr) {
-                vSemaphoreDelete(mouth_seq_lock_);
-                mouth_seq_lock_ = nullptr;
-            }
-            if (mouth_seq_signal_ != nullptr) {
-                vSemaphoreDelete(mouth_seq_signal_);
-                mouth_seq_signal_ = nullptr;
-            }
-            return;
-        }
-        BaseType_t ok = xTaskCreate(&StackChanBoard::MouthSequenceTaskTrampoline,
-                                    "mouth_seq", 4096, this,
-                                    tskIDLE_PRIORITY + 2,
-                                    &mouth_seq_task_);
-        if (ok != pdPASS) {
-            ESP_LOGE(TAG, "Failed to create mouth_seq task");
-            vSemaphoreDelete(mouth_seq_lock_);
-            mouth_seq_lock_ = nullptr;
-            vSemaphoreDelete(mouth_seq_signal_);
-            mouth_seq_signal_ = nullptr;
-            mouth_seq_task_ = nullptr;
-        } else {
-            ESP_LOGI(TAG, "Mouth sequence task ready");
-        }
-    }
 
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
@@ -2810,171 +2106,36 @@ private:
                 return root;
             });
 
-        // Set the avatar face (one of: idle, happy, thinking, sad, surprised,
-        // embarrassed, off).
-        // The image is rendered as a 320x240 overlay on top of the chat UI's
-        // emoji_label_ / emoji_image_; LVGL theme/Application emotion updates
-        // will keep happening underneath but are visually masked.
-        // 'off' hides the avatar lv_obj and disables blink so the underlying
-        // xiaozhi-esp32 screens (WiFi config UI, OTA, settings) become visible.
-        // A subsequent set_avatar with any other face brings it back, and
-        // restores blink to whatever state it was in before going off.
         mcp_server.AddTool(
             "self.display.set_avatar",
-            "Set the avatar face displayed on the LCD. face must be one of: "
-            "idle, happy, thinking, sad, surprised, embarrassed, off. "
-            "'off' hides the avatar and disables blink so the underlying "
-            "xiaozhi-esp32 screens (WiFi config UI, OTA, settings) are "
-            "visible; calling set_avatar with another face brings the avatar "
-            "back and restores the previous blink state.",
+            "Set the avatar expression. face must be one of: "
+            "neutral, happy, laughing, funny, sad, crying, angry, loving, "
+            "embarrassed, surprised, shocked, thinking, winking, cool, "
+            "relaxed, delicious, kissy, confident, sleepy, silly, confused, off. "
+            "'off' hides the avatar canvas so the underlying xiaozhi UI is visible.",
             PropertyList({Property("face", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string face = properties["face"].value<std::string>();
                 cJSON* root = cJSON_CreateObject();
                 cJSON_AddStringToObject(root, "face", face.c_str());
 
-                bool applied = false;
+                if (!display_ || !display_->IsAvatarReady()) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "Avatar not ready yet.");
+                    return root;
+                }
+
                 if (face == "off") {
-                    // Any avatar transition supersedes an in-flight mouth
-                    // sequence (per Issue #5 acceptance: "set_avatar() takes
-                    // effect after the queued sequence finishes (or
-                    // interrupts cleanly)").
-                    RequestMouthSequenceCancel();
-                    applied = SetAvatarOff();
-                } else if (AvatarImageFor(face.c_str()) != nullptr) {
-                    RequestMouthSequenceCancel();
-                    applied = SetAvatarExpression(face.c_str());
+                    display_->SetAvatarOff();
+                    cJSON_AddBoolToObject(root, "ok", true);
+                } else if (stackchan_avatar::IsKnownEmotion(face.c_str())) {
+                    display_->SetAvatarEmotion(face.c_str());
+                    cJSON_AddBoolToObject(root, "ok", true);
                 } else {
                     cJSON_AddBoolToObject(root, "ok", false);
-                    cJSON_AddStringToObject(root, "error",
-                        "Unknown face. Allowed: idle, happy, thinking, sad, "
-                        "surprised, embarrassed, off.");
-                    ESP_LOGW(TAG, "set_avatar rejected: unknown face '%s'", face.c_str());
-                    return root;
+                    cJSON_AddStringToObject(root, "error", "Unknown face name.");
                 }
-                cJSON_AddBoolToObject(root, "ok", applied);
-                if (!applied) {
-                    cJSON_AddStringToObject(root, "error",
-                        "Display not ready yet; retry after a moment.");
-                }
-                ESP_LOGI(TAG, "set_avatar: face=%s applied=%d", face.c_str(), applied);
-                return root;
-            });
-
-        // Phase 2: lip-sync. Swap the avatar to one of the mouth-only frames.
-        // The shape is held until the next set_avatar / set_mouth / blink, so
-        // callers should drive it from their TTS / audio level loop.
-        mcp_server.AddTool(
-            "self.display.set_mouth",
-            "Set the avatar mouth shape. mouth must be one of: "
-            "closed, half, open, e, u. Held until the next set_avatar/set_mouth, "
-            "or until a blink restores the resting face.",
-            PropertyList({Property("mouth", kPropertyTypeString)}),
-            [this](const PropertyList& properties) -> ReturnValue {
-                std::string mouth = properties["mouth"].value<std::string>();
-                bool valid = (MouthImageFor(mouth.c_str()) != nullptr);
-                cJSON* root = cJSON_CreateObject();
-                cJSON_AddStringToObject(root, "mouth", mouth.c_str());
-                if (!valid) {
-                    cJSON_AddBoolToObject(root, "ok", false);
-                    cJSON_AddStringToObject(root, "error",
-                        "Unknown mouth. Allowed: closed, half, open, e, u.");
-                    ESP_LOGW(TAG, "set_mouth rejected: unknown shape '%s'", mouth.c_str());
-                    return root;
-                }
-                // Any explicit mouth set supersedes an in-flight sequence
-                // (Issue #5: set_mouth("closed") doubles as the cancellation
-                // path so we don't need a separate cancel_mouth_sequence
-                // tool).
-                RequestMouthSequenceCancel();
-                bool applied = SetMouthShape(mouth.c_str());
-                cJSON_AddBoolToObject(root, "ok", applied);
-                if (!applied) {
-                    cJSON_AddStringToObject(root, "error",
-                        "Display not ready yet; retry after a moment.");
-                }
-                ESP_LOGI(TAG, "set_mouth: mouth=%s applied=%d", mouth.c_str(), applied);
-                return root;
-            });
-
-        // Phase 2: lip-sync sequence. Queue and play a list of
-        // {shape, duration_ms} pairs locally so a TTS-driven caller can
-        // ship one MCP call per utterance instead of N back-to-back
-        // set_mouth calls (which suffer per-step WebSocket RTT jitter).
-        // The MCP Property type system has no array kind, so the gateway
-        // serialises `steps` to a JSON string and sends it as `steps_json`.
-        // See Phase 2 lip-sync sequence playback comment block above for
-        // the concurrency model and trade-offs (blink pause, atomic queue
-        // replacement, final shape held).
-        mcp_server.AddTool(
-            "self.display.set_mouth_sequence",
-            "Queue a lip-sync sequence and play it locally. steps_json must "
-            "decode to a JSON array of {shape, duration_ms} objects (1..256 "
-            "items, shape in {closed, half, open, e, u}, duration_ms in "
-            "10..10000). Returns immediately; calling set_mouth, set_avatar, "
-            "or this tool again interrupts the in-flight sequence. "
-            "Autonomous blink is paused while a sequence plays and resumed "
-            "when it ends (resume reads the user's most recent set_blink "
-            "intent, not a snapshot). The final shape is held until the "
-            "next set_mouth / set_avatar call, or until the next autonomous "
-            "blink restores the resting face — the same Phase 2 trade-off "
-            "that applies to set_mouth, since blink ends by repainting the "
-            "full face. If the final shape must persist visually, disable "
-            "blink with set_blink(false) before the sequence (or append a "
-            "closed step if you just want the mouth to close at the end).",
-            PropertyList({Property("steps_json", kPropertyTypeString)}),
-            [this](const PropertyList& properties) -> ReturnValue {
-                std::string steps_json = properties["steps_json"].value<std::string>();
-                MouthSequenceEnqueueResult r = EnqueueMouthSequence(steps_json);
-                cJSON* root = cJSON_CreateObject();
-                cJSON_AddBoolToObject(root, "ok", r.ok);
-                if (!r.ok) {
-                    cJSON_AddStringToObject(root, "error", r.error.c_str());
-                    ESP_LOGW(TAG, "set_mouth_sequence rejected: %s", r.error.c_str());
-                } else {
-                    cJSON_AddNumberToObject(root, "queued_steps", r.queued_steps);
-                    cJSON_AddNumberToObject(root, "estimated_duration_ms",
-                                            static_cast<double>(r.total_duration_ms));
-                    ESP_LOGI(TAG, "set_mouth_sequence queued %d steps (%u ms)",
-                             r.queued_steps, (unsigned)r.total_duration_ms);
-                }
-                return root;
-            });
-
-        // Phase 2: enable/disable autonomous blinking. When enabled, a
-        // background timer fires every 3-6 s (random) and runs the four-step
-        // blink sequence (half -> closed -> half -> face). Also captures
-        // the user's intent into blink_desired_ so that a call issued while
-        // a mouth sequence is suppressing blink is honoured when the
-        // sequence finishes.
-        mcp_server.AddTool(
-            "self.display.set_blink",
-            "Enable or disable autonomous eye blinking on the avatar. "
-            "When enabled, a brief blink animation runs every 3-6 seconds. "
-            "If a set_mouth_sequence is currently playing, blink is paused "
-            "until the sequence ends; this call still records the intent "
-            "and is applied at the sequence end (or immediately if no "
-            "sequence is running).",
-            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
-            [this](const PropertyList& properties) -> ReturnValue {
-                bool enabled = properties["enabled"].value<bool>();
-                blink_desired_.store(enabled, std::memory_order_release);
-                bool deferred = mouth_seq_active_.load(std::memory_order_acquire);
-                if (!deferred) {
-                    if (enabled) {
-                        StartBlinkTimer();
-                    } else {
-                        StopBlinkTimer();
-                    }
-                }
-                cJSON* root = cJSON_CreateObject();
-                cJSON_AddBoolToObject(root, "enabled", enabled);
-                cJSON_AddBoolToObject(root, "ok", true);
-                if (deferred) {
-                    cJSON_AddBoolToObject(root, "deferred", true);
-                }
-                ESP_LOGI(TAG, "set_blink: enabled=%d deferred=%d",
-                         (int)enabled, deferred ? 1 : 0);
+                ESP_LOGI(TAG, "set_avatar: face=%s", face.c_str());
                 return root;
             });
 
@@ -3181,6 +2342,160 @@ private:
         ESP_LOGI(TAG, "StackChan MCP tools registered");
     }
 
+    // ---- Claude.ai relay polling ----
+    // Periodically HTTP-GETs the relay server for commands queued by
+    // Claude.ai via MCP, then executes them locally (expression, servo,
+    // chat message). Runs on its own FreeRTOS task.
+
+    static constexpr const char* RELAY_POLL_URL =
+        "https://stackchan.xiaomemory.win/poll?token=sc-poll-Kx7mR9pQvW3nJ5tY";
+    static constexpr const char* RELAY_ACK_URL =
+        "https://stackchan.xiaomemory.win/ack?token=sc-poll-Kx7mR9pQvW3nJ5tY";
+    static constexpr int RELAY_POLL_INTERVAL_MS = 3000;
+    static constexpr int RELAY_HTTP_TIMEOUT_MS  = 10000;
+    static constexpr int RELAY_BUF_SIZE = 1024;
+
+    TaskHandle_t relay_task_ = nullptr;
+
+    static void RelayPollTaskEntry(void* arg) {
+        static_cast<StackChanBoard*>(arg)->RelayPollLoop();
+    }
+
+    void RelayPollLoop() {
+        vTaskDelay(pdMS_TO_TICKS(8000));
+        ESP_LOGI(TAG, "Relay polling started (%d ms interval)", RELAY_POLL_INTERVAL_MS);
+
+        while (true) {
+            RelayPollOnce();
+            vTaskDelay(pdMS_TO_TICKS(RELAY_POLL_INTERVAL_MS));
+        }
+    }
+
+    void RelayPollOnce() {
+        esp_http_client_config_t config = {};
+        config.url = RELAY_POLL_URL;
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.timeout_ms = RELAY_HTTP_TIMEOUT_MS;
+
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) return;
+
+        char buf[RELAY_BUF_SIZE] = {0};
+        int len = 0;
+
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err == ESP_OK) {
+            int content_len = esp_http_client_fetch_headers(client);
+            if (content_len > 0 && content_len < RELAY_BUF_SIZE) {
+                len = esp_http_client_read(client, buf, RELAY_BUF_SIZE - 1);
+                if (len > 0) buf[len] = '\0';
+            } else if (content_len < 0) {
+                len = esp_http_client_read(client, buf, RELAY_BUF_SIZE - 1);
+                if (len > 0) buf[len] = '\0';
+            }
+        } else {
+            ESP_LOGD(TAG, "Relay poll HTTP open failed: %s", esp_err_to_name(err));
+        }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        if (len <= 0) return;
+
+        cJSON* root = cJSON_Parse(buf);
+        if (!root) return;
+
+        cJSON* action_j = cJSON_GetObjectItem(root, "action");
+        if (!action_j || !cJSON_IsString(action_j)
+            || strcmp(action_j->valuestring, "none") == 0) {
+            cJSON_Delete(root);
+            return;
+        }
+
+        const char* action = action_j->valuestring;
+        cJSON* params = cJSON_GetObjectItem(root, "params");
+        cJSON* id_j = cJSON_GetObjectItem(root, "id");
+
+        ESP_LOGI(TAG, "Relay command: %s", action);
+        ExecuteRelayCommand(action, params);
+
+        if (id_j && cJSON_IsString(id_j)) {
+            RelayAck(id_j->valuestring);
+        }
+
+        cJSON_Delete(root);
+    }
+
+    void ExecuteRelayCommand(const char* action, cJSON* params) {
+        if (!display_) return;
+
+        if (strcmp(action, "emote") == 0) {
+            cJSON* expr = params ? cJSON_GetObjectItem(params, "expression") : nullptr;
+            if (expr && cJSON_IsString(expr)) {
+                display_->SetAvatarEmotion(expr->valuestring);
+            }
+        } else if (strcmp(action, "speak") == 0) {
+            cJSON* expr = params ? cJSON_GetObjectItem(params, "expression") : nullptr;
+            cJSON* text = params ? cJSON_GetObjectItem(params, "text") : nullptr;
+            if (expr && cJSON_IsString(expr)) {
+                display_->SetAvatarEmotion(expr->valuestring);
+            }
+            if (text && cJSON_IsString(text)) {
+                display_->SetChatMessage("assistant", text->valuestring);
+            }
+            // TTS audio only streams over the on-demand WebSocket channel.
+            // A speak that arrives while the channel is closed used to be
+            // silent (text-only); wake the channel so the relay's pending
+            // TTS can stream down once the hello handshake completes.
+            {
+                auto& app = Application::GetInstance();
+                app.Schedule([&app]() {
+                    if (app.GetDeviceState() == kDeviceStateIdle) {
+                        ESP_LOGI(TAG, "speak: audio channel closed, waking for TTS");
+                        app.ToggleChatState();
+                    }
+                });
+            }
+        } else if (strcmp(action, "move_head") == 0) {
+            cJSON* yaw_j   = params ? cJSON_GetObjectItem(params, "yaw") : nullptr;
+            cJSON* pitch_j = params ? cJSON_GetObjectItem(params, "pitch") : nullptr;
+            int yaw   = (yaw_j   && cJSON_IsNumber(yaw_j))   ? (int)yaw_j->valuedouble   : 0;
+            int pitch = (pitch_j && cJSON_IsNumber(pitch_j)) ? (int)pitch_j->valuedouble : 0;
+            WriteHeadAngles(yaw, pitch);
+        } else if (strcmp(action, "wiggle") == 0) {
+            StartServoWobble();
+        } else if (strcmp(action, "nuzzle") == 0) {
+            display_->OnPetted();
+            StartServoWobble();
+        } else {
+            ESP_LOGW(TAG, "Relay: unknown action '%s'", action);
+        }
+    }
+
+    void RelayAck(const char* cmd_id) {
+        char body[128];
+        snprintf(body, sizeof(body), "{\"id\":\"%s\"}", cmd_id);
+
+        esp_http_client_config_t config = {};
+        config.url = RELAY_ACK_URL;
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.timeout_ms = 5000;
+        config.method = HTTP_METHOD_POST;
+
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) return;
+
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, body, strlen(body));
+        esp_http_client_perform(client);
+        esp_http_client_cleanup(client);
+    }
+
+    void InitializeRelayPoll() {
+        xTaskCreate(&StackChanBoard::RelayPollTaskEntry, "relay_poll",
+                    8192, this, 5, &relay_task_);
+        ESP_LOGI(TAG, "Relay poll task created");
+    }
+
 public:
     StackChanBoard() {
         InitializePowerSaveTimer();
@@ -3204,11 +2519,8 @@ public:
         InitializeServo();
         InitializeSi12tTouch();
         I2cDetect();
-        // Avatar auto-display disabled: WiFi config UI needs to be visible.
-        // Avatar is shown on-demand via MCP set_avatar command.
-        // InitializeAvatar();
-        InitializeMouthSequenceTask();
         RegisterMcpTools();
+        InitializeRelayPoll();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -3254,15 +2566,12 @@ public:
         WifiBoard::SetPowerSaveLevel(level);
     }
 
-    // Phase 4 audio (Issue #76): drive avatar mouth animation alongside TTS
-    // playback. The gateway's tts.start / tts.stop notifications reach this
-    // board via Application::OnIncomingJson() -> Board::OnTtsStart/Stop().
     virtual void OnTtsStart() override {
-        StartTtsLipSync();
+        if (display_) display_->StartSpeaking();
     }
 
     virtual void OnTtsStop() override {
-        StopTtsLipSync();
+        if (display_) display_->StopSpeaking();
     }
 
     virtual Backlight *GetBacklight() override {
