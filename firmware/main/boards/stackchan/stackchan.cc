@@ -2055,6 +2055,19 @@ private:
             if (text && cJSON_IsString(text)) {
                 display_->SetChatMessage("assistant", text->valuestring);
             }
+            // TTS audio only streams over the on-demand WebSocket channel.
+            // A speak that arrives while the channel is closed used to be
+            // silent (text-only); wake the channel so the relay's pending
+            // TTS can stream down once the hello handshake completes.
+            {
+                auto& app = Application::GetInstance();
+                app.Schedule([&app]() {
+                    if (app.GetDeviceState() == kDeviceStateIdle) {
+                        ESP_LOGI(TAG, "speak: audio channel closed, waking for TTS");
+                        app.ToggleChatState();
+                    }
+                });
+            }
         } else if (strcmp(action, "move_head") == 0) {
             cJSON* yaw_j   = params ? cJSON_GetObjectItem(params, "yaw") : nullptr;
             cJSON* pitch_j = params ? cJSON_GetObjectItem(params, "pitch") : nullptr;
